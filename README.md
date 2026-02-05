@@ -22,4 +22,4 @@
 # Rewrite code 
 - degradation classifier
 - degradation attention
-- flux lora fintune code(modfiy from diffusers)
+- flux lora fintune code(modfiy from diffusers)# FLUX-Deg
