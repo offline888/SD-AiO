@@ -1,0 +1,338 @@
+# general settings
+name: DegNetDINObase_CDD11_seed0_AdamW_lr5e4_iter200k_freeze
+model_type: DegNet
+scale: 1
+num_gpu: auto
+manual_seed: 0
+classify: true
+
+datasets:
+  train_1:
+    name: rain
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/rain
+    io_backend:
+      type: disk 
+    gt_size: 224
+    use_hflip: true
+    use_rot: false  
+    label: [1, 0, 0, 0]
+  
+  train_2:
+    name: snow
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/snow
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: true
+    use_rot: false 
+    label: [0, 1, 0, 0]
+
+  train_3:
+    name: haze
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/haze
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: true
+    use_rot: false # [修改]
+    label: [0, 0, 1, 0]
+
+  train_4:
+    name: lowlight
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/clear
+    dataroot_lq: //home/yhmi/data/TrainData/CDD-11/CDD-11_train/low
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: true
+    use_rot: false # [修改]
+    label: [0, 0, 0, 1]
+
+  train_5:
+    name: haze+rain
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/haze_rain
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: true
+    use_rot: false # [修改]
+    label: [1, 0, 1, 0]
+
+  train_6:
+    name: haze+snow
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/haze_snow
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: true
+    use_rot: false # [修改]
+    label: [0, 1, 1, 0]
+
+  train_7:
+    name: lowlight+haze
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/low_haze
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: true
+    use_rot: false # [修改]
+    label: [0, 0, 1, 1]
+
+  train_8:
+    name: lowlight+haze+rain
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/low_haze_rain
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: true
+    use_rot: false # [修改]
+    label: [1, 0, 1, 1]
+
+  train_9:
+    name: lowlight+haze+snow
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/low_haze_snow
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: true
+    use_rot: false # [修改]
+    label: [0, 1, 1, 1]
+
+  train_10:
+    name: lowlight+rain
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/low_rain
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: true
+    use_rot: false # [修改]
+    label: [1, 0, 0, 1]
+
+  train_11:
+    name: lowlight+snow
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_train/low_snow
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: true
+    use_rot: false 
+    label: [0, 1, 0, 1]
+
+  val_1:
+    name: rain
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/rain
+    io_backend:
+      type: disk
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    center_crop: 224
+    label: [1, 0, 0, 0]
+  val_2:
+    name: snow
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/snow
+    io_backend:
+      type: disk
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    center_crop: 224
+    label: [0, 1, 0, 0]
+  val_3:
+    name: haze
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/haze
+    io_backend:
+      type: disk
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    center_crop: 224
+    label: [0, 0, 1, 0]
+  val_4:
+    name: lowlight
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/low
+    io_backend:
+      type: disk
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    center_crop: 224
+    label: [0, 0, 0, 1]
+  val_5:
+    name: haze+rain
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/haze_rain
+    io_backend:
+      type: disk
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    center_crop: 224
+    label: [1, 0, 1, 0]
+  val_6:
+    name: haze+snow
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/haze_snow
+    io_backend:
+      type: disk
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    center_crop: 224
+    label: [0, 1, 1, 0]
+  val_7:
+    name: lowlight+haze
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/low_haze
+    io_backend:
+      type: disk
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    center_crop: 224
+    label: [0, 0, 1, 1]
+  val_8:
+    name: lowlight+haze+rain
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/low_haze_rain
+    io_backend:
+      type: disk
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    center_crop: 224
+    label: [1, 0, 1, 1]
+  val_9:
+    name: lowlight+haze+snow
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/low_haze_snow
+    io_backend:
+      type: disk
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    center_crop: 224
+    label: [0, 1, 1, 1]
+  val_10:
+    name: lowlight+rain
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/low_rain
+    io_backend:
+      type: disk
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    center_crop: 224
+    label: [1, 0, 0, 1]
+  val_11:
+    name: lowlight+snow
+    type: PairedImageDataset
+    dataroot_gt: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/clear
+    dataroot_lq: /home/yhmi/data/TrainData/CDD-11/CDD-11_test/low_snow
+    io_backend:
+      type: disk
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    center_crop: 224
+    label: [0, 1, 0, 1]
+
+dataloader:
+  phase: train
+  use_shuffle: true
+  
+  num_worker_per_gpu: 8
+  batch_size_per_gpu: 32
+  dataset_enlarge_ratio: 10
+  
+  prefetch_mode: cuda
+  pin_memory: true
+  presist_workers: true
+
+dataloader_val:
+  phase: val
+  use_shuffle: false
+  num_worker_per_gpu: 4
+  batch_size_per_gpu: 1
+  dataset_enlarge_ratio: 1
+  prefetch_mode: ~
+  pin_memory: true
+
+# network structures
+find_unused_parameters: false
+
+network_dc:
+  type: DegNet_DINO
+  num_types: 4
+
+path:
+  pretrain_network_dc: /home/yhmi/data/model/dinov2-base
+  strict_load_dc: false
+  resume_state: ~
+
+# training settings
+train:
+  ema_decay: 0.999
+  optim_dc:
+    type: AdamW
+    lr: !!float 5e-4
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [100000,100000]
+    restart_weights: [1,1]
+    eta_min: !!float 1e-6
+  
+  #total_epoch: 10
+  total_iter: 200000
+  warmup_iter: -1
+
+  # losses
+  classify_opt:
+    type: BCEWithLogitsLoss
+
+# validation settings
+val:
+  val_freq: !!float 5000
+  save_img: false
+  metrics: ~
+
+# logging settings
+logger:
+  print_freq: 500
+  save_checkpoint_freq: !!float 5e4
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500
