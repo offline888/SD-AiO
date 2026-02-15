@@ -1,8 +1,50 @@
 import torch
 import torch.nn as nn
 import transformers
-from typing import Optional
-import torchvision.models as models
+from torchvision.models.resnet import ResNet, Bottleneck as BottleneckBlock
+
+class PromptIR_DC(nn.Module):
+    def __init__(
+        self,
+        latent_dim=1024,    # 输入向量的维度 D
+        num_layers=3,       # 残差块的数量
+        num_classes=3,      # 最终分类数
+    ):
+        super().__init__()
+        
+        self.input_proj = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim//2),
+            nn.LayerNorm(latent_dim//2),
+            nn.GELU()
+        )
+
+        self.layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(latent_dim//2, latent_dim//2),
+                nn.LayerNorm(latent_dim//2),
+                nn.GELU(),
+                nn.Linear(latent_dim//2, latent_dim//2)
+            ) for _ in range(num_layers)
+        ])
+
+        self.act=nn.GELU()
+
+        self.classifier = nn.Sequential (
+            nn.Linear(latent_dim//2, latent_dim//4),
+            nn.GELU(),
+            nn.Linear(latent_dim//4, num_classes),
+        )
+
+    def forward(self, latent_vec):
+        x = self.input_proj(latent_vec)
+        
+        for layer in self.layers:
+            x = x + layer(x)
+            x = self.act(x)
+            
+        severity = self.classifier(x)
+
+        return severity
 
 class DegNet_CLIP(nn.Module):
     """
@@ -48,11 +90,16 @@ class DegNet_CLIP(nn.Module):
             nn.GELU(),
         )
 
-        self.classifier = nn.Linear(feature_dim // 4, num_types)
-        # self.classifier=models.resnet18(
+        #self.classifier = nn.Linear(feature_dim // 4, num_types)
+        #self.classifier=models.resnet18(
         #                pretrained=False,
         #                num_classes=num_types,
         #                in_channels=feature_dim // 4)
+        self.classifier = PromptIR_DC (
+                        latent_dim = feature_dim // 4, 
+                        num_layers = 3, 
+                        num_classes = self.num_types,
+                        )
 
         self._init_weights()
 
@@ -60,14 +107,16 @@ class DegNet_CLIP(nn.Module):
             self._freeze_encoder()
 
     def _init_weights(self):
-
         nn.init.orthogonal_(self.deg_dict)
-
-        for m in [self.deg_head, self.classifier]:
+        
+        def init_linear(m):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+        
+        self.deg_head.apply(init_linear)
+        self.classifier.apply(init_linear)
 
     def _freeze_encoder(self):
         for param in self.encoder.parameters():
@@ -88,9 +137,9 @@ class DegNet_CLIP(nn.Module):
 
         deg_feat = severity @ self.deg_dict.T
 
-        logit=torch.sigmoid(severity)
+        probs=torch.sigmoid(severity)
 
-        return deg_feat,logit,severity
+        return deg_feat, probs, severity
 
 class DegNet_DINO(nn.Module):
     """
@@ -136,11 +185,16 @@ class DegNet_DINO(nn.Module):
             nn.GELU(),
         )
 
-        self.classifier = nn.Linear(feature_dim // 4, num_types)
-        # self.classifier=models.resnet18(
+        #self.classifier = nn.Linear(feature_dim // 4, num_types)
+        #self.classifier=models.resnet18(
         #                pretrained=False,
         #                num_classes=num_types,
         #                in_channels=feature_dim // 4)
+        self.classifier = PromptIR_DC (
+                        latent_dim = feature_dim // 4, 
+                        num_layers = 3, 
+                        num_classes = self.num_types,
+                        )
 
         self._init_weights()
 
@@ -150,11 +204,15 @@ class DegNet_DINO(nn.Module):
 
     def _init_weights(self):
         nn.init.orthogonal_(self.deg_dict)
-        for m in [self.deg_head, self.classifier]:
+        
+        def init_linear(m):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+        
+        self.deg_head.apply(init_linear)
+        self.classifier.apply(init_linear)
 
     def _freeze_encoder(self):
         for param in self.encoder.parameters():
@@ -175,14 +233,7 @@ class DegNet_DINO(nn.Module):
 
         deg_feat = severity @ self.deg_dict.T
 
-        logit=torch.sigmoid(severity)
+        probs = torch.sigmoid(severity)
 
-        return deg_feat, logit, severity
+        return deg_feat, probs, severity
 
-
-class DegNet_maskdcpt(nn.Module):
-    def __init__(self):
-        pass
-    def forward(self,x):
-        pass
-'''

@@ -1,0 +1,7 @@
+pip3 install torch torchvision
+pip install numpy scipy  matplotlib  jupyterlab
+pip install transformers accelerate datasets diffusers 
+pip install opencv-python
+pip install scikit-image
+pip install einops
+pip install timm fvcore
