@@ -15,6 +15,10 @@ from os import path as osp
 
 import torch
 warnings.filterwarnings("ignore")
+
+# SwanLab is lazily imported to avoid blocking at startup
+HAS_SWANLAB = False
+
 from basicsr.data import build_dataloader, build_dataset
 from basicsr.data.concat_dataset import ConcatDataset
 from basicsr.data.data_sampler import EnlargedSampler
@@ -53,7 +57,26 @@ def init_tb_loggers(opt):
         tb_logger = init_tb_logger(
             log_dir=osp.join(opt["root_path"], "tb_logger", opt["name"])
         )
-    return tb_logger
+
+    # Initialize swanlab logger
+    swanlab_logger = None
+    if opt["logger"].get("use_swanlab", False) and "debug" not in opt["name"]:
+        try:
+            import swanlab
+            swanlab.init(
+                project=opt["logger"].get("swanlab_project", "basicsr"),
+                experiment_name=opt["name"],
+                log_dir=osp.join(opt["root_path"], "swanlog", opt["name"]),
+                config=opt,
+            )
+            swanlab_logger = swanlab
+            print(f"[Swanlab] Initialized project: {opt['logger'].get('swanlab_project', 'basicsr')}")
+        except ImportError:
+            print("[Swanlab] Warning: swanlab not installed. Run: pip install swanlab")
+        except Exception as e:
+            print(f"[Swanlab] Warning: Failed to initialize: {e}")
+
+    return tb_logger, swanlab_logger
 
 
 def create_train_val_dataloader(opt, logger):
@@ -220,7 +243,7 @@ def train_pipeline(root_path):
     logger.info(get_env_info())
     logger.info(dict2str(opt))
     # initialize wandb and tb loggers
-    tb_logger = init_tb_loggers(opt)
+    tb_logger, swanlab_logger = init_tb_loggers(opt)
 
     # create train and validation dataloaders
     result = create_train_val_dataloader(opt, logger)
@@ -387,6 +410,10 @@ def train_pipeline(root_path):
                 log_vars.update(model.get_current_log())
                 msg_logger(log_vars)
 
+                # Log to swanlab
+                if swanlab_logger is not None:
+                    swanlab_logger.log(log_vars)
+
             # save models and training states
             if current_iter % opt["logger"]["save_checkpoint_freq"] == 0:
                 logger.info("Saving models and training states.")
@@ -426,6 +453,10 @@ def train_pipeline(root_path):
 
     if tb_logger:
         tb_logger.close()
+
+    # Close swanlab logger
+    if swanlab_logger is not None:
+        swanlab.finish()
 
 
 if __name__ == "__main__":

@@ -1,279 +1,268 @@
-import os
 import argparse
+import os
+
 import torch
+import torch.backends.cudnn as cudnn
 import torch.nn as nn
-from torchvision import transforms
-from torch.utils.data import DataLoader, ConcatDataset, random_split
-from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.utils import set_seed
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
+from src.data.dataset import InterleavedShuffleDataset, MultiLabelClassification
+from src.networks.degnet import DegNet_CLIP, DegNet_DINO
+from torch.utils.data import ChainDataset, DataLoader
+from torchmetrics.classification import (
+    MultilabelAccuracy,
+    MultilabelAUROC,
+    MultilabelAveragePrecision,
+    MultilabelF1Score,
+    MultilabelJaccardIndex,
+    MultilabelPrecision,
+    MultilabelRecall,
+)
+from torchvision.transforms import v2 as transforms
 from tqdm import tqdm
 
-from src.networks.degnet import DegNet_CLIP, DegNet_DINO
-from src.data.dataset import MultiLabelClassification
+MODEL_FACTORY = {"DegNet_CLIP": DegNet_CLIP, "DegNet_DINO": DegNet_DINO}
 
-MODEL_FACTORY = {
-    "DegNet_CLIP": DegNet_CLIP,
-    "DegNet_DINO": DegNet_DINO
-}
-
-def transform_pipeline(data_config):
-    resize = data_config.get('resize', 384)
-    use_hflip = data_config.get('use_hflip', False)
-    use_rot = data_config.get('use_rot', False)
-    
-    operations = [
-        transforms.Resize((resize,resize)),
-        transforms.RandomHorizontalFlip() if use_hflip else None,
-        transforms.RandomRotation(15) if use_rot else None,
-    ]
-    operations = [op for op in operations if op is not None]
-     
-    operations.extend([
-        transforms.ToTensor(),
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-    ])
-    
-    return transforms.Compose(operations)
 
 def train(args):
 
     config = OmegaConf.load(args.config)
-    ddp_kwargs = DistributedDataParallelKwargs(
-        find_unused_parameters=config.get('find_unused_parameters', False)
-    )
-    
-    accelerator = Accelerator(
-        mixed_precision=config.train.mixed_precision,
-        log_with="swanlab" if config.logging.use_swanlab else None, 
-        project_dir=config.name,
-        kwargs_handlers=[ddp_kwargs]
-    )
-    if accelerator.is_main_process and config.logging.use_swanlab:
-        accelerator.init_trackers(
-            project_name=config.logging.swanlab_project, 
-            config=OmegaConf.to_container(config, resolve=True),
-        )
-        print(f"[Info] Experiment started: {config.name}")
-
     set_seed(config.seed)
 
-    data_list = []
-    deg_types = config.data.degradations
-    
-    for data_name, data_config in config.data.datasets.items():
-        try:
-            transform = transform_pipeline(data_config)
-        
-            datasets = MultiLabelClassification(
-                dataset_cfg=data_config,
-                class_names=deg_types ,
-                transforms=transform
-            )
+    cudnn.benchmark = True
 
-            data_list.append(datasets)
-            
-            if accelerator.is_main_process:
-                print(f" - Successfully loaded {data_name}: {len(datasets)} images")
-        except Exception as error:
-            if accelerator.is_main_process:
-                print(f" [Warning] Failed to load dataset {data_name}: {error}")
-
-    if not data_list:
-        raise RuntimeError("No datasets were loaded. Please check your configuration paths.")
-
-    full_dataset = ConcatDataset(data_list)
-    
-    if config.data.split_val:
-        validation_size = int(len(full_dataset) * config.data.val_split)
-        train_size = len(full_dataset) - validation_size
-        
-        train_dataset, validation_dataset = random_split(
-            full_dataset, 
-            [train_size, validation_size],
-            generator=torch.Generator().manual_seed(config.seed)
-        )
-    else:
-        train_dataset = full_dataset
-        validation_dataset = None
-
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=config.data.dataloader.train.batch_size,
-        num_workers=config.data.dataloader.train.num_workers,
-        shuffle=config.data.dataloader.use_shuffle,
-        prefetch_factor=4,
-        pin_memory=True,
-        persistent_workers=True,
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=config.accelerator.get("find_unused_parameters", False)
     )
-    
-    validation_dataloader = DataLoader(
-        validation_dataset,
-        batch_size=config.data.dataloader.val.batch_size,
-        num_workers=config.data.dataloader.val.num_workers,
-        shuffle=False,
-        persistent_workers=True,
-        pin_memory=True,
-    ) if validation_dataset else None
 
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config.accelerator.get("grad_accum", 1),
+        mixed_precision=config.accelerator.get("mixed_precision", "no"),
+        log_with="swanlab" if config.logging.use_swanlab else None,
+        project_dir=config.experiments_dir,
+        kwargs_handlers=[ddp_kwargs],
+    )
 
-    ModelClass = MODEL_FACTORY[config.network.type]
-    
-    backbone_argument_name = "clip_type" if "CLIP" in config.network.type else "dino_type"
-    
-    model = ModelClass(
+    Model = MODEL_FACTORY[config.network.type]
+    backbone_key = "clip_type" if "CLIP" in config.network.type else "dino_type"
+    model = Model(
         feature_dim=config.network.feature_dim,
         num_types=config.network.num_classes,
         freeze_encoder=config.network.freeze_encoder,
-        **{backbone_argument_name: config.network.backbone}
+        freeze_deg_dict=config.network.get("freeze_deg_dict", False),
+        **{backbone_key: config.network.backbone},
     )
 
-    optimizer = torch.optim.AdamW(
+    train_datasets, val_datasets = [], []
+    deg_types = config.data.degradations
+
+    for data_name, data_config in config.data.datasets.items():
+        ops = [
+            transforms.Resize(
+                (data_config.get("resize", 224), data_config.get("resize", 224))),
+        ]
+        if data_config.get("use_hflip"):
+            ops.append(transforms.RandomHorizontalFlip())
+        if data_config.get("use_rot"):
+            ops.append(transforms.RandomRotation(15))
+        ops.extend(
+            [
+                transforms.ToImage(),
+                transforms.ToDtype(torch.float32, scale=True),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+        dataset_transforms = transforms.Compose(ops)
+        dataset = MultiLabelClassification(data_config, deg_types, dataset_transforms)
+
+        if data_name.startswith("ValDataset"):
+            val_datasets.append(dataset)
+        elif data_name.startswith("TrainDataset"):
+            train_datasets.append(dataset)
+        else:
+            raise ValueError(f"Invalid dataset name: {data_name}")
+
+    # bulid
+    val_cfg = config.data.dataloader.val
+    val_loader = DataLoader(
+        ChainDataset(val_datasets),
+        batch_size=val_cfg.batch_size,
+        num_workers=val_cfg.get("num_workers", 4),
+        pin_memory=val_cfg.get("pin_memory", True),
+        persistent_workers=val_cfg.get("persistent_workers", True),
+        drop_last=False,
+        prefetch_factor=val_cfg.get("prefetch_factor", 2),
+    ) if val_datasets else None
+
+    # Build train loader
+    train_cfg = config.data.dataloader.train
+    train_loader = DataLoader(
+        InterleavedShuffleDataset(train_datasets, buffer_size=2000, seed=config.seed),
+        shuffle=False,
+        batch_size=train_cfg.batch_size,
+        num_workers=train_cfg.get("num_workers", 8),
+        pin_memory=train_cfg.get("pin_memory", True),
+        persistent_workers=train_cfg.get("persistent_workers", True),
+        drop_last=train_cfg.get("drop_last", True),
+        prefetch_factor=train_cfg.get("prefetch_factor", 2),
+    )
+
+    # Build optimizer and scheduler
+    opt_cls = getattr(torch.optim, config.train.optim.type)
+    optimizer = opt_cls(
         model.parameters(),
         lr=config.train.optim.lr,
-        weight_decay=config.train.optim.weight_decay
+        weight_decay=config.train.optim.weight_decay,
     )
-    
+
+    total_steps = (
+        len(train_loader) // accelerator.gradient_accumulation_steps
+    ) * config.train.num_epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=config.train.scheduler.T_max,
-        eta_min=config.train.scheduler.eta_min
-    )
-    
-    loss_function = nn.BCEWithLogitsLoss(
-        pos_weight=torch.tensor([config.train.loss.loss_weight]).to(accelerator.device)
+        optimizer, T_max=total_steps, eta_min=config.train.scheduler.eta_min
     )
 
-    model, optimizer, train_dataloader, validation_dataloader, scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, validation_dataloader, scheduler
-    )
+    # Pre-cache criterion
+    criterion = getattr(nn, config.train.loss.type)()
 
-    total_epochs = config.train.num_epochs
-    global_step_counter = 0
-    best_validation_accuracy = 0.0
-    
-    checkpoint_dir = os.path.join(config.experiments_dir, "checkpoints")
-    if accelerator.is_main_process:
-        os.makedirs(checkpoint_dir, exist_ok=True)
+    # Pre-create metrics on device
+    num_labels = config.network.num_classes
+    metrics = {
+        "mAP": MultilabelAveragePrecision(num_labels=num_labels, average="macro").to(
+            accelerator.device
+        ),
+        "F1": MultilabelF1Score(num_labels=num_labels, average="macro").to(
+            accelerator.device
+        ),
+        "Acc": MultilabelAccuracy(num_labels=num_labels, average="macro").to(
+            accelerator.device
+        ),
+        "AUROC": MultilabelAUROC(num_labels=num_labels, average="macro").to(
+            accelerator.device
+        ),
+        "Precision": MultilabelPrecision(num_labels=num_labels, average="macro").to(
+            accelerator.device
+        ),
+        "Recall": MultilabelRecall(num_labels=num_labels, average="macro").to(
+            accelerator.device
+        ),
+        "IoU": MultilabelJaccardIndex(num_labels=num_labels, average="macro").to(
+            accelerator.device
+        ),
+    }
 
-    # Let's Train! !🚀
-    for epoch in range(total_epochs):
-        
-        model.train()
-        
-        progress_bar = tqdm(
-            train_dataloader, 
-            disable=not accelerator.is_main_process, 
-            desc=f"Epoch {epoch+1}/{total_epochs}"
+    # Validation function
+    def validate():
+        """Validate on merged val loader. All classes have pos/neg samples → macro avg valid."""
+        for metric in metrics.values():
+            metric.reset()
+
+        for imgs, lbls in val_loader:
+            with torch.no_grad(), accelerator.autocast():
+                _, probs, _ = model(imgs)
+                gathered_probs = accelerator.gather_for_metrics(probs)
+                gathered_lbls = accelerator.gather_for_metrics(lbls)
+                for metric_name, metric in metrics.items():
+                    metric.update(gathered_probs, gathered_lbls.long())
+
+        return {name: metric.compute().item() for name, metric in metrics.items()}
+
+    log_interval = config.logging.get("log_interval", 100)
+    max_grad_norm = config.train.max_grad_norm
+    is_main = accelerator.is_main_process
+
+    if val_loader is not None:
+        model, optimizer, train_loader, scheduler, val_loader = accelerator.prepare(
+            model, optimizer, train_loader, scheduler, val_loader
         )
-        
-        for step, (images, labels) in enumerate(progress_bar):
+    else:
+        model, optimizer, train_loader, scheduler = accelerator.prepare(
+            model, optimizer, train_loader, scheduler
+        )
+
+    unwrap_fn = accelerator.unwrap_model
+
+    if is_main and config.logging.use_swanlab:
+        swanlab_config = OmegaConf.to_container(config)
+        log_dir = config.logging.get("swanlab_log_dir", config.experiments_dir)
+        swanlab_config["log_dir"] = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        accelerator.init_trackers(config.logging.swanlab_project, swanlab_config)
+
+    best_mAP = 0
+    global_step = 0
+    ckpt_dir = os.path.join(config.experiments_dir, "checkpoints")
+
+    if is_main:
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+    for epoch in range(config.train.num_epochs):
+        model.train()
+        pbar = tqdm(train_loader, disable=not is_main, desc=f"Epoch {epoch + 1}")
+
+        for images, labels in pbar:
             with accelerator.accumulate(model):
-                _, _, logits = model(images)
-                
-                loss = loss_function(logits, labels)
-                
+                with accelerator.autocast():
+                    _, _, logits = model(images)
+                    loss = criterion(logits, labels)
+
                 accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
-                
-                if step % config.logging.log_interval == 0 and accelerator.is_main_process:
-                    current_learning_rate = optimizer.param_groups[0]["lr"]
-                    
-                    # 3. 使用 accelerator.log，它会自动发给 swanlab
-                    accelerator.log({
-                        "train/loss": loss.item(),
-                        "train/learning_rate": current_learning_rate,
-                        "epoch": epoch
-                    }, step=global_step_counter)
-                    
-                    progress_bar.set_postfix(loss=f"{loss.item():.4f}")
-                
-                global_step_counter += 1
-        
-        scheduler.step()
-        
 
-        should_validate = validation_dataloader is not None and (epoch + 1) % config.val.val_freq == 0
-        
-        if should_validate:
+                if accelerator.sync_gradients:
+                    global_step += 1
+                    if global_step % log_interval == 0:
+                        accelerator.log(
+                            {
+                                "train/loss": loss.item(),
+                                "train/lr": optimizer.param_groups[0]["lr"],
+                            },
+                            step=global_step,
+                        )
+
+            if is_main:
+                pbar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                )
+
+        # Validation: single merged pass over all val datasets
+        if val_loader is not None and (epoch + 1) % config.val.val_freq == 0:
             model.eval()
-            total_validation_loss = 0.0
-            total_correct_predictions = 0.0
-            total_validation_samples = 0.0
-            
-            for images, labels in validation_dataloader:
-                with torch.no_grad():
-                    # Get probabilities for metrics, logits for loss
-                    _, probs, logits = model(images)
-                    
-                    batch_loss = loss_function(logits, labels)
-                    total_validation_loss += batch_loss.item()
-                    
-                    # Use probabilities > 0.5 for thresholding
-                    predictions = (probs > 0.5).float()
-                    
-                    num_classes = config.network.num_classes
-                    correct_matches = (predictions == labels).sum(dim=1)
-                    batch_correct_count = (correct_matches == num_classes).sum()
-                    
-                    total_correct_predictions += batch_correct_count
-                    total_validation_samples += labels.size(0)
-            
+            results = validate()
 
-            metrics_tensor = torch.tensor(
-                [total_validation_loss, total_correct_predictions, total_validation_samples], 
-                device=accelerator.device
-            )
-            
-            # [num_processes, 3]
-            gathered_metrics = accelerator.gather(metrics_tensor)
-            
-            # gather all gpus
-            global_val_loss_sum = gathered_metrics[:, 0].sum().item()
-            global_correct_sum = gathered_metrics[:, 1].sum().item()
-            global_samples_sum = gathered_metrics[:, 2].sum().item()
-            
-            # Calculate global averages
-            total_batches_across_gpus = len(validation_dataloader) * accelerator.num_processes
-            final_validation_loss = global_val_loss_sum / total_batches_across_gpus
-            
-            final_validation_accuracy = global_correct_sum / global_samples_sum if global_samples_sum > 0 else 0.0
-            
-            # Main process logging
-            if accelerator.is_main_process:
-                print(f"\nValidation Result - Epoch {epoch+1}:")
-                print(f"  Loss: {final_validation_loss:.4f}")
-                print(f"  Exact Accuracy: {final_validation_accuracy:.4f}")
-                
-                # 4. 同样使用 accelerator.log
-                accelerator.log({
-                    "val/loss": final_validation_loss,
-                    "val/accuracy": final_validation_accuracy
-                }, step=global_step_counter)
-                
-                unwrapped_model = accelerator.unwrap_model(model)
-                
-                # 1. Periodic Save
-                if (epoch + 1) % config.train.model_save_freq == 0:
-                    checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch+1}.pth")
-                    torch.save(unwrapped_model.state_dict(), checkpoint_path)
-                    print(f"  Checkpoint saved: {checkpoint_path}")
-                
-                # 2. Best Model Save
-                if config.train.weight_save_best:
-                    if final_validation_accuracy > best_validation_accuracy:
-                        best_validation_accuracy = final_validation_accuracy
-                        best_model_path = os.path.join(checkpoint_dir, "best_model.pth")
-                        torch.save(unwrapped_model.state_dict(), best_model_path)
-                        print(f"  🏆 New best model saved! (Acc: {best_validation_accuracy:.4f})")
+            if is_main:
+                metric_str = " | ".join([f"{m}: {results[m]:.4f}" for m in metrics.keys()])
+                print(f"\n{'=' * 60}")
+                print(f"Epoch {epoch + 1} Validation (all datasets merged)")
+                print(f"{'=' * 60}")
+                print(f"{metric_str}")
+                print(f"{'=' * 60}")
 
-    # 5. 自动结束所有 tracker
+                accelerator.log(
+                    {f"val/{m}": results[m] for m in metrics.keys()},
+                    step=global_step,
+                )
+
+                # Save best model based on mAP
+                if results["mAP"] > best_mAP:
+                    best_mAP = results["mAP"]
+                    torch.save(
+                        unwrap_fn(model).state_dict(),
+                        os.path.join(ckpt_dir, "best_model.pth"),
+                    )
+                    print(f"New Best mAP: {best_mAP:.4f} | Saved to {ckpt_dir}/best_model.pth")
+
     accelerator.end_training()
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Accelerate Training Script for Multi-Label Classification")
-    parser.add_argument("--config", '-c',type=str, default="config.yaml", help="Path to the YAML configuration file")
-    args = parser.parse_args()
-    
-    train(args)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c", "--config", type=str, default="config.yaml")
+    train(parser.parse_args())

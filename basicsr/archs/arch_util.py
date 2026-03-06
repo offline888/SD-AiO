@@ -311,3 +311,25 @@ to_2tuple = _ntuple(2)
 to_3tuple = _ntuple(3)
 to_4tuple = _ntuple(4)
 to_ntuple = _ntuple
+
+
+class Local_Base(nn.Module):
+    """Base class for models with local window conversion capability.
+
+    Used in models like NAFNet for handling different input sizes.
+    """
+    def __init__(self):
+        super(Local_Base, self).__init__()
+        self.register_buffer('mean', torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def convert(self, base_size=None, train_size=None, fast_imp=False):
+        """Convert model for different input sizes."""
+        if base_size is not None:
+            self.base_size = base_size
+        if train_size is not None:
+            self.train_size = train_size
+
+    def forward(self, x):
+        """Forward with possible size conversion."""
+        return x

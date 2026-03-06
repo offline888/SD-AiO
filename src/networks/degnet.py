@@ -65,6 +65,7 @@ class DegNet_CLIP(nn.Module):
         num_types: int = 4,
         clip_type: str = "openai/clip-vit-base-patch32",
         freeze_encoder: bool = False,
+        freeze_deg_dict: bool = False,
     ):
         super(DegNet_CLIP, self).__init__()
 
@@ -80,7 +81,7 @@ class DegNet_CLIP(nn.Module):
 
         self.deg_dict = nn.Parameter(torch.randn(feature_dim, num_types))
         # nn.init.xavier_uniform_(self.deg_dict)
-        
+
         self.deg_head = nn.Sequential(
             nn.Linear(self.clip_dim, feature_dim),
             nn.GELU(),
@@ -106,6 +107,9 @@ class DegNet_CLIP(nn.Module):
         if freeze_encoder:
             self._freeze_encoder()
 
+        if freeze_deg_dict:
+            self._freeze_deg_dict()
+
     def _init_weights(self):
         nn.init.orthogonal_(self.deg_dict)
         
@@ -121,6 +125,9 @@ class DegNet_CLIP(nn.Module):
     def _freeze_encoder(self):
         for param in self.encoder.parameters():
             param.requires_grad = False
+
+    def _freeze_deg_dict(self):
+        self.deg_dict.requires_grad = False
 
     def load_encoder(self, model_path):
         self.encoder = transformers.CLIPVisionModel.from_pretrained(model_path)
@@ -159,6 +166,7 @@ class DegNet_DINO(nn.Module):
         num_types: int = 4,
         dino_type: str = "facebook/dinov2-base",
         freeze_encoder: bool = False,
+        freeze_deg_dict: bool = False,
     ): 
         super(DegNet_DINO, self).__init__()
 
@@ -175,7 +183,7 @@ class DegNet_DINO(nn.Module):
         self.deg_dict = nn.Parameter(torch.randn(feature_dim, num_types))
         nn.init.orthogonal_(self.deg_dict)
         # nn.init.xavier_uniform_(self.deg_dict)
-        
+
         self.deg_head = nn.Sequential(
             nn.Linear(self.dino_dim, feature_dim),
             nn.GELU(),
@@ -186,7 +194,7 @@ class DegNet_DINO(nn.Module):
         )
 
         #self.classifier = nn.Linear(feature_dim // 4, num_types)
-        #self.classifier=models.resnet18(
+        #self.classifier = models.resnet18(
         #                pretrained=False,
         #                num_classes=num_types,
         #                in_channels=feature_dim // 4)
@@ -200,6 +208,9 @@ class DegNet_DINO(nn.Module):
 
         if freeze_encoder:
             self._freeze_encoder()
+
+        if freeze_deg_dict:
+            self._freeze_deg_dict()
 
 
     def _init_weights(self):
@@ -217,6 +228,9 @@ class DegNet_DINO(nn.Module):
     def _freeze_encoder(self):
         for param in self.encoder.parameters():
             param.requires_grad = False
+
+    def _freeze_deg_dict(self):
+        self.deg_dict.requires_grad = False
 
     def load_encoder(self, model_path):
         self.encoder = transformers.Dinov2Model.from_pretrained(model_path)

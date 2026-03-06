@@ -7,9 +7,11 @@ from tqdm import tqdm
 from basicsr.archs import build_network
 from basicsr.losses import build_loss
 from basicsr.utils import get_root_logger
+from basicsr.utils.registry import MODEL_REGISTRY
 
 from .base_model import BaseModel
 
+@MODEL_REGISTRY.register()
 class DegNet(BaseModel):
 
     def __init__(self, opt):
@@ -18,26 +20,13 @@ class DegNet(BaseModel):
         self.net_dc = build_network(opt["network_dc"])
         self.net_dc = self.model_to_device(self.net_dc)
 
-        load_path_dc = self.opt["path"].get("pretrain_network_dc", None)
-        if load_path_dc is not None:
-            self.net_dc.load_encoder(load_path_dc)
-            '''
-            param_key = self.opt["path"].get("param_key_dc", "params")
-            self.load_network(
-                self.net_dc,
-                load_path_dc,
-                self.opt["path"].get("strict_load_dc", True),
-                param_key,
-                self.opt.get("remove_norm", False),
-            )
-            '''
-
         if self.is_train:
             self.init_training_settings()
 
     def init_training_settings(self):
-        # sself.net_dc.train()
-        self.net_dc.set_train(False)
+        # 读取 freeze_encoder 配置
+        freeze_encoder = self.opt["network_dc"].get("freeze_encoder", True)
+        self.net_dc.set_train(enable_encoder_train=not freeze_encoder)
 
         train_opt = self.opt["train"]
 
@@ -50,13 +39,6 @@ class DegNet(BaseModel):
             self.net_dc_ema = copy.deepcopy(self.net_dc)
             self.net_dc_ema.eval()
             self.net_dc_ema = self.net_dc_ema.to(self.device)
-            '''
-            self.net_dc_ema = build_network(self.opt["network_dc"]).to(self.device)
-            self.model_ema(0)
-            self.net_dc_ema.eval()
-            '''
-
-        self.hook_outputs = list() 
 
         # define losses
         if train_opt.get("classify_opt"):
@@ -95,7 +77,7 @@ class DegNet(BaseModel):
     def optimize_parameters(self, current_iter):
         self.optimizer_dc.zero_grad()
 
-        _, _, _, self.logits = self.net_dc(self.lq)
+        _, _, self.logits = self.net_dc(self.lq)
 
         l_total = 0
         loss_dict = OrderedDict()
@@ -160,7 +142,7 @@ class DegNet(BaseModel):
     @torch.no_grad()
     def test(self):
         self.net_dc.set_train()
-        _, _, _, self.output = self.net_dc(self.lq)
+        _, _, self.output = self.net_dc(self.lq)
         self.net_dc.eval()
 
     def dist_validation(self, dataloader, current_iter, tb_logger, save_img=False, clamp=True):
@@ -215,7 +197,7 @@ class DegNet(BaseModel):
         self.best_metric_results = record
 
     def _update_best_metric_result(self, metric, val, current_iter):
-        if val >= self.best_metric_results[metric]["val"]:
+        if val > self.best_metric_results[metric]["val"]:
             self.best_metric_results[metric]["val"] = val
             self.best_metric_results[metric]["iter"] = current_iter
 

@@ -1,0 +1,112 @@
+name: DegNet_DINO_Classification
+seed: 42
+experiments_dir: /home/yhmi/data/experiments
+
+accelerator:
+  mixed_precision: "bf16" # "no", "fp16", "bf16"
+  find_unused_parameters: true
+
+data:
+  degradations: ['Blur', 'Noise', 'JPEG', 'Haze', 'Rain', 'Lowlight']
+  split_val: true 
+  val_split: 0.2
+  
+  dataloader:
+    use_shuffle: true
+    train:
+      batch_size: 512
+      num_workers: 32
+      pin_memory: true
+      persistent_workers: true
+      #prefetch_factor: 4
+
+    val:
+      batch_size: 1
+      num_workers: 8
+      pin_memory: true
+      persistent_workers: true
+  
+  datasets:
+    TrainDataset1: 
+      name: Blur
+      degradation: Blur
+      path: /home/yhmi/data/Datadir/FoundIR/01Blur/LQ
+      resize: 224
+      #use_hflip: true
+      #use_rot: true
+    
+    TrainDataset2:
+      name: Rain
+      degradation: Rain
+      path: /home/yhmi/data/Datadir/FoundIR/10Rain/LQ
+      resize: 224
+      #use_hflip: true
+      #use_rot: true
+      
+    TrainDataset3:
+      name: Haze
+      degradation: Haze
+      path: /home/yhmi/data/Datadir/FoundIR/08Haze/LQ
+      resize: 224
+      #use_hflip: true
+      #use_rot: true
+      
+    TrainDataset4:
+      name: Lowlight
+      degradation: Lowlight
+      path: /home/yhmi/data/Datadir/FoundIR/14Lowlight/LQ
+      resize: 224
+      #use_hflip: true
+      #use_rot: true
+      
+    TrainDataset5:
+      name: Noise
+      degradation: Noise
+      path: /home/yhmi/data/Datadir/FoundIR/05Noise/LQ
+      resize: 224
+      #use_hflip: true
+      #use_rot: true
+      
+    TrainDataset6:
+      name: JPEG
+      degradation: JPEG
+      path: /home/yhmi/data/Datadir/FoundIR/06JPEG/LQ
+      resize: 224
+      #use_hflip: true
+      #use_rot: true
+  
+  # if provide val dataset, set spilt_val: false
+
+network:
+  type: DegNet_DINO
+  backbone: //home/yhmi/data/model/dinov2-base
+  feature_dim: 512
+  num_classes: 6 # len of Degradations
+  freeze_encoder: False
+  freeze_deg_dict: true  # 冻结退化字典 U，用于分类阶段训练
+
+train:
+  num_epochs: 10
+  max_grad_norm: 1.0
+  
+  optim:
+    type: AdamW
+    lr: 1e-4
+    weight_decay: 0.01
+  
+  scheduler:
+    type: CosineAnnealingLR
+    eta_min: 1e-6
+
+  loss:
+    type: BCEWithLogitsLoss
+
+val:
+  val_freq: 1 
+  save_img: false
+  metrics: ["accuracy", "mAP", "F1"] 
+
+logging:
+  use_swanlab: true
+  swanlab_project: "Train_FoundIR_MultiLabel_DegNetCLIP"
+  log_interval: 10

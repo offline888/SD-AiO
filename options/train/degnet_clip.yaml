@@ -1,5 +1,5 @@
 # general settings
-name: DegNetDINO_FoundIR_MultiLabel_Classification
+name: DegNetCLIP_FoundIR_MultiLabel_Classification
 model_type: DegNet
 scale: 1
 num_gpu: auto
@@ -51,6 +51,28 @@ datasets:
     use_rot: false
     label: [0, 1, 0, 0, 0, 0]
 
+  train_06JPEG:
+    name: JPEG
+    type: SingleImageClassificationDataset
+    dataroot_lq: /home/yhmi/data/Datadir/FoundIR/06JPEG/LQ_train
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: true
+    use_rot: false
+    label: [0, 0, 1, 0, 0, 0]
+
+  val_06JPEG:
+    name: JPEG
+    type: SingleImageClassificationDataset
+    dataroot_lq: /home/yhmi/data/Datadir/FoundIR/06JPEG/LQ_val
+    io_backend:
+      type: disk
+    gt_size: 224
+    use_hflip: false
+    use_rot: false
+    label: [0, 0, 1, 0, 0, 0]
+
   train_08Haze:
     name: Haze
     type: SingleImageClassificationDataset
@@ -60,7 +82,7 @@ datasets:
     gt_size: 224
     use_hflip: true
     use_rot: false
-    label: [0, 0, 1, 0, 0, 0]
+    label: [0, 0, 0, 1, 0, 0]
 
   val_08Haze:
     name: Haze
@@ -71,7 +93,7 @@ datasets:
     gt_size: 224
     use_hflip: false
     use_rot: false
-    label: [0, 0, 1, 0, 0, 0]
+    label: [0, 0, 0, 1, 0, 0]
 
   train_10Rain:
     name: Rain
@@ -82,7 +104,7 @@ datasets:
     gt_size: 224
     use_hflip: true
     use_rot: false
-    label: [0, 0, 0, 1, 0, 0]
+    label: [0, 0, 0, 0, 1, 0]
 
   val_10Rain:
     name: Rain
@@ -93,7 +115,7 @@ datasets:
     gt_size: 224
     use_hflip: false
     use_rot: false
-    label: [0, 0, 0, 1, 0, 0]
+    label: [0, 0, 0, 0, 1, 0]
 
   train_14Lowlight:
     name: Lowlight
@@ -104,34 +126,12 @@ datasets:
     gt_size: 224
     use_hflip: true
     use_rot: false
-    label: [0, 0, 0, 0, 1, 0]
+    label: [0, 0, 0, 0, 0, 1]
 
   val_14Lowlight:
     name: Lowlight
     type: SingleImageClassificationDataset
     dataroot_lq: /home/yhmi/data/Datadir/FoundIR/14Lowlight/LQ_val
-    io_backend:
-      type: disk
-    gt_size: 224
-    use_hflip: false
-    use_rot: false
-    label: [0, 0, 0, 0, 1, 0]
-
-  train_Clean:
-    name: Clean
-    type: SingleImageClassificationDataset
-    dataroot_lq: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
-    io_backend:
-      type: disk
-    gt_size: 224
-    use_hflip: true
-    use_rot: false
-    label: [0, 0, 0, 0, 0, 1]
-
-  val_Clean:
-    name: Clean
-    type: SingleImageClassificationDataset
-    dataroot_lq: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
     io_backend:
       type: disk
     gt_size: 224
@@ -144,7 +144,7 @@ dataloader:
   use_shuffle: true
   
   num_worker_per_gpu: 32
-  batch_size_per_gpu: 128
+  batch_size_per_gpu: 256
   dataset_enlarge_ratio: 10
   
   prefetch_mode: cuda
@@ -160,12 +160,11 @@ dataloader_val:
 find_unused_parameters: false
 
 network_dc:
-  type: DegNet_DINO
-  num_types: 6  # ['Blur', 'Noise', 'Haze', 'Rain', 'Lowlight', 'Clean']
+  type: DegNet_CLIP
+  num_types: 6  # ['Blur', 'Noise', 'JPEG', 'Haze', 'Rain', 'Lowlight']
   feature_dim: 512
-  encoder_type: /home/yhmi/data/model/dinov2-base
+  encoder_type: /home/yhmi/data/model/clip-vit-base-patch32
   freeze_encoder: false
-  freeze_deg_dict: true  # 冻结退化字典 U，用于分类阶段训练
 
 path:
   resume_state: ~
@@ -200,8 +199,8 @@ logger:
   save_checkpoint_freq: !!float 5e4
   use_swanlab: true
   use_tb_logger: false
-  swanlab_project: "DegNet_DINO_FoundIR_Classification"
-  swanlab_run_name: "degnet_dino_baseline"
+  swanlab_project: "DegNet_CLIP_FoundIR_Classification"
+  swanlab_run_name: "degnet_clip_baseline"
   log_interval: 100
   wandb:
     project: ~
