@@ -181,18 +181,21 @@ network:
 
 train:
   num_epochs: 10
-  max_grad_norm: 0.5
+  max_grad_norm: 1.0
   
   optim:
     type: AdamW
-    lr: 5e-5
+    lr: 1e-4
     weight_decay: 0.01
   
   scheduler:
     eta_min: 1e-6
 
   loss:
-    type: BCEWithLogitsLoss
+    type: MultiLabelFocalLoss
+    gamma: 2.0
+    alpha: null
+    label_smoothing: 0.0
 
 val:
   val_freq: 1

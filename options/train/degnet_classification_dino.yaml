@@ -32,7 +32,7 @@ data:
       degradation: Blur
       path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/LQ_train
       resize: 224
-      #use_hflip: true
+      use_hflip: true
       #use_rot: true
     
     TrainDataset2:
@@ -40,7 +40,7 @@ data:
       degradation: Rain
       path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/LQ_train
       resize: 224
-      #use_hflip: true
+      use_hflip: true
       #use_rot: true
       
     TrainDataset3:
@@ -48,7 +48,7 @@ data:
       degradation: Haze
       path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/LQ_train
       resize: 224
-      #use_hflip: true
+      use_hflip: true
       #use_rot: true
       
     TrainDataset4:
@@ -56,7 +56,7 @@ data:
       degradation: Lowlight
       path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/LQ_train
       resize: 224
-      #use_hflip: true
+      use_hflip: true
       #use_rot: true
       
     TrainDataset5:
@@ -64,7 +64,7 @@ data:
       degradation: Noise
       path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/LQ_train
       resize: 224
-      #use_hflip: true
+      use_hflip: true
       #use_rot: true
       
     TrainDataset6:
@@ -72,7 +72,7 @@ data:
       degradation: Clean
       path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
       resize: 224
-      #use_hflip: true
+      use_hflip: true
       #use_rot: true
 
     TrainDataset7:
@@ -80,31 +80,32 @@ data:
       degradation: [Blur, Noise]
       path: /home/yhmi/data/Datadir/FoundIR_768/02Blur_Noise/LQ_train
       resize: 224
+      use_hflip: true
 
     TrainDataset8:
       name: Lowlight_Haze
       degradation: [Lowlight, Haze]
       path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/LQ_train
       resize: 224
-
+      use_hflip: true
     TrainDataset9:
       name: Rain_Haze
       degradation: [Rain, Haze]
       path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/LQ_train
       resize: 224
-
+      use_hflip: true
     TrainDataset10:
       name: Lowlight_Blur
       degradation: [Lowlight, Blur]
       path: /home/yhmi/data/Datadir/FoundIR_768/15Lowlight_Blur/LQ_train
       resize: 224
-
+      use_hflip: true
     TrainDataset11:
       name: Lowlight_Noise
       degradation: [Lowlight, Noise]
       path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/LQ_train
       resize: 224
-
+      use_hflip: true
     ValDataset1:
       name: Blur
       degradation: Blur
@@ -181,11 +182,11 @@ network:
 
 train:
   num_epochs: 10
-  max_grad_norm: 0.5
+  max_grad_norm: 1.0
   
   optim:
     type: AdamW
-    lr: 5e-5
+    lr: 1e-4
     weight_decay: 0.01
   
   scheduler:
@@ -193,6 +194,7 @@ train:
 
   loss:
     type: BCEWithLogitsLoss
+    label_smoothing: 0.05
 
 val:
   val_freq: 1

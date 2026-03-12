@@ -62,19 +62,19 @@ class DegNet_CLIP(nn.Module):
     def __init__(
         self,
         feature_dim: int = 512,
-        num_types: int = 4,
+        num_types: int = 6,
         clip_type: str = "openai/clip-vit-base-patch32",
         freeze_encoder: bool = False,
         freeze_deg_dict: bool = False,
     ):
         super(DegNet_CLIP, self).__init__()
 
-        try:
-            config = transformers.CLIPVisionConfig.from_pretrained(clip_type)
-            self.encoder = transformers.CLIPVisionModel(config)
-        except:
-            config = transformers.CLIPVisionConfig()
-            self.encoder = transformers.CLIPVisionModel(config)
+        #try:
+        #    config = transformers.CLIPVisionConfig.from_pretrained(clip_type)
+        #    self.encoder = transformers.CLIPVisionModel(config)
+        #except:
+        config = transformers.CLIPVisionConfig()
+        self.encoder = transformers.CLIPVisionModel(config)
 
         self.clip_dim = config.hidden_size
         self.num_types = num_types
@@ -163,7 +163,7 @@ class DegNet_DINO(nn.Module):
     def __init__(
         self,
         feature_dim: int = 512,
-        num_types: int = 4,
+        num_types: int = 6,
         dino_type: str = "facebook/dinov2-base",
         freeze_encoder: bool = False,
         freeze_deg_dict: bool = False,

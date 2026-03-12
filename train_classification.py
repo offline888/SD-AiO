@@ -1,5 +1,6 @@
 import argparse
 import os
+from datetime import datetime
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -8,6 +9,7 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
 from src.data.dataset import InterleavedShuffleDataset, MultiLabelClassification
+from src.loss import build_loss
 from src.networks.degnet import DegNet_CLIP, DegNet_DINO
 from torch.utils.data import ChainDataset, DataLoader
 from torchmetrics.classification import (
@@ -28,6 +30,8 @@ MODEL_FACTORY = {"DegNet_CLIP": DegNet_CLIP, "DegNet_DINO": DegNet_DINO}
 def train(args):
 
     config = OmegaConf.load(args.config)
+    exp_name = config.get("name", "default")
+    exp_name = f"{exp_name}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     set_seed(config.seed)
 
     cudnn.benchmark = True
@@ -124,7 +128,7 @@ def train(args):
     )
 
     # Pre-cache criterion
-    criterion = getattr(nn, config.train.loss.type)()
+    criterion = build_loss(config.train.loss, device=accelerator.device)
 
     # Pre-create metrics on device
     num_labels = config.network.num_classes
@@ -185,14 +189,14 @@ def train(args):
 
     if is_main and config.logging.use_swanlab:
         swanlab_config = OmegaConf.to_container(config)
-        log_dir = config.logging.get("swanlab_log_dir", config.experiments_dir)
+        log_dir = os.path.join(config.experiments_dir, exp_name, "logs")
         swanlab_config["log_dir"] = log_dir
         os.makedirs(log_dir, exist_ok=True)
         accelerator.init_trackers(config.logging.swanlab_project, swanlab_config)
 
     best_mAP = 0
     global_step = 0
-    ckpt_dir = os.path.join(config.experiments_dir, "checkpoints")
+    ckpt_dir = os.path.join(config.experiments_dir, exp_name, "checkpoints")
 
     if is_main:
         os.makedirs(ckpt_dir, exist_ok=True)

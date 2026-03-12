@@ -1,91 +1,83 @@
+from typing import Optional, Sequence
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
-from typing import Optional
 
-class FocalLoss(nn.Module):
-    """Focal Loss, as described in https://arxiv.org/abs/1708.02002.
 
-    It is essentially an enhancement to cross entropy loss and is
-    useful for classification tasks when there is a large class imbalance.
-    x is expected to contain raw, unnormalized scores for each class.
-    y is expected to contain class labels.
+class MultiLabelFocalLoss(nn.Module):
+    """Focal Loss for multi-label classification.
+
+    FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)
+
+    Reference: https://arxiv.org/abs/1708.02002
 
     Shape:
-        - x: (batch_size, C) or (batch_size, C, d1, d2, ..., dK), K > 0.
-        - y: (batch_size,) or (batch_size, d1, d2, ..., dK), K > 0.
+        - logits: (batch_size, num_classes) - raw unnormalized scores
+        - targets: (batch_size, num_classes) - binary labels (0 or 1)
     """
 
     def __init__(
         self,
-        alpha: Optional[Tensor] = None,
-        gamma: float = 0.0,
+        alpha: Optional[Sequence] = None,
+        gamma: float = 2.0,
         reduction: str = "mean",
-        ignore_index: int = -100,
+        label_smoothing: float = 0.0,
     ):
         """Constructor.
 
         Args:
-            alpha (Tensor, optional): Weights for each class. Defaults to None.
-            gamma (float, optional): A constant, as described in the paper.
-                Defaults to 0.
+            alpha (Sequence or Tensor, optional): Weights for each class,
+                shape (num_classes,). Defaults to None.
+            gamma (float, optional): Focusing parameter. Defaults to 2.0.
             reduction (str, optional): 'mean', 'sum' or 'none'.
                 Defaults to 'mean'.
-            ignore_index (int, optional): class label to ignore.
-                Defaults to -100.
+            label_smoothing (float, optional): Label smoothing factor.
+                Defaults to 0.0 (no smoothing).
         """
         if reduction not in ("mean", "sum", "none"):
             raise ValueError('Reduction must be one of: "mean", "sum", "none".')
+        if not 0.0 <= label_smoothing < 1.0:
+            raise ValueError("label_smoothing must be in [0.0, 1.0)")
 
         super().__init__()
-        self.alpha = alpha
         self.gamma = gamma
-        self.ignore_index = ignore_index
         self.reduction = reduction
+        self.label_smoothing = label_smoothing
 
-        self.nll_loss = nn.NLLLoss(
-            weight=alpha, reduction="none", ignore_index=ignore_index
-        )
+        # Convert Sequence to Tensor if needed
+        if alpha is not None and not isinstance(alpha, Tensor):
+            alpha = torch.tensor(alpha, dtype=torch.float32)
+        self.alpha = alpha
 
-    def __repr__(self):
-        arg_keys = ["alpha", "gamma", "ignore_index", "reduction"]
-        arg_vals = [self.__dict__[k] for k in arg_keys]
-        arg_strs = [f"{k}={v!r}" for k, v in zip(arg_keys, arg_vals)]
-        arg_str = ", ".join(arg_strs)
-        return f"{type(self).__name__}({arg_str})"
+    def forward(self, logits: Tensor, targets: Tensor) -> Tensor:
+        # logits: (N, C) - raw scores
+        # targets: (N, C) - binary labels
 
-    def forward(self, x: Tensor, y: Tensor) -> Tensor:
-        if x.ndim > 2:
-            # (N, C, d1, d2, ..., dK) --> (N * d1 * ... * dK, C)
-            c = x.shape[1]
-            x = x.permute(0, *range(2, x.ndim), 1).reshape(-1, c)
-            # (N, d1, d2, ..., dK) --> (N * d1 * ... * dK,)
-            y = y.view(-1)
+        # Apply label smoothing
+        if self.label_smoothing > 0:
+            targets = targets * (1 - self.label_smoothing) + self.label_smoothing / 2
 
-        unignored_mask = y != self.ignore_index
-        y = y[unignored_mask]
-        if len(y) == 0:
-            return torch.tensor(0.0)
-        x = x[unignored_mask]
+        # Compute sigmoid probabilities
+        probs = torch.sigmoid(logits)
 
-        # compute weighted cross entropy term: -alpha * log(pt)
-        # (alpha is already part of self.nll_loss)
-        log_p = F.log_softmax(x, dim=-1)
-        ce = self.nll_loss(log_p, y)
+        # Binary cross entropy: -[y*log(p) + (1-y)*log(1-p)]
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
 
-        # get true class column from each row
-        all_rows = torch.arange(len(x))
-        log_pt = log_p[all_rows, y]
+        # Focal weight: (1 - p_t)^gamma
+        pt = torch.where(targets == 1, probs, 1 - probs)
+        focal_weight = (1 - pt) ** self.gamma
 
-        # compute focal term: (1 - pt)^gamma
-        pt = log_pt.exp()
-        focal_term = (1 - pt) ** self.gamma
+        # Apply alpha weighting if provided
+        if self.alpha is not None:
+            alpha = self.alpha.to(logits.device)
+            alpha_expanded = alpha.unsqueeze(0).expand_as(targets)
+            focal_weight = focal_weight * alpha_expanded
 
-        # the full loss: -alpha * ((1 - pt)^gamma) * log(pt)
-        loss = focal_term * ce
+        loss = focal_weight * bce
 
         if self.reduction == "mean":
-            loss = loss.mean()
+            return loss.mean()
         elif self.reduction == "sum":
-            loss = loss.sum()
+            return loss.sum()
         return loss

@@ -1,10 +1,10 @@
 # ignore folder
-basicsr/
+/basicsr/
 /tb_logger/
 /swanlog/
 resize.py
 resize_foundir.py
 process.py
-
+load.py
 # ignore all pycache folders
 __pycache__/
