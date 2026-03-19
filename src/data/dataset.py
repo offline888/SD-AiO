@@ -4,8 +4,7 @@ import pickle
 from torch.utils.data import IterableDataset
 import cv2
 import numpy as np
-from copy import deepcopy
-
+from PIL import Image
 
 _cache_dir = "/tmp/dataset_cache"
 os.makedirs(_cache_dir, exist_ok=True)
@@ -59,15 +58,6 @@ def _load_or_scan(root):
 
 
 class MultiLabelClassification(IterableDataset):
-    """
-    Optimized IterableDataset for large-scale image classification.
-    
-    Key optimizations:
-    1. File list caching - avoid rescanning on each startup
-    2. Uses DataLoader worker-based sharding (not manual rank/world_size)
-    3. Fast cv2 image loading
-    4. Zero-copy label tensor (read-only, no clone)
-    """
 
     def __init__(self, dataset_cfg, class_names, transforms=None):
         self.num_classes = len(class_names)
@@ -79,10 +69,18 @@ class MultiLabelClassification(IterableDataset):
         deg_types = [str(deg_config)] if isinstance(deg_config, (str, int)) else [str(d) for d in deg_config]
         
         # Create base label (reused for all samples in this dataset)
-        self.base_label = torch.zeros(self.num_classes, dtype=torch.float32)
+        # Shape: [num_classes, 2] - each row is [exists, not_exists]
+        # Exists: [1, 0], Not exists: [0, 1]
+        self.base_label = torch.zeros(self.num_classes, 2, dtype=torch.float32)
         for deg in deg_types:
             if deg in self.class_to_idx:
-                self.base_label[self.class_to_idx[deg]] = 1.0
+                i = self.class_to_idx[deg]
+                self.base_label[i, 0] = 1.0   # exists: [1, 0]
+        
+        # Fill "not exists" column for classes that are not in deg_types
+        for i in range(self.num_classes):
+            if self.base_label[i, 0] == 0:
+                self.base_label[i, 1] = 1.0   # not exists: [0, 1]
 
         root = os.path.abspath(dataset_cfg['path'])
         
@@ -90,13 +88,16 @@ class MultiLabelClassification(IterableDataset):
         self.img_list = _load_or_scan(root)
 
     def _load_image(self, img_path):
-        """Load image using cv2 (faster than PIL)"""
+        """Load image using cv2 with optimization"""
+        # Use IMREAD_UNCHANGED + faster BGR→RGB conversion
         img = cv2.imread(img_path, cv2.IMREAD_COLOR)
         if img is None:
+            # Fallback to PIL for unusual formats
             from PIL import Image
             img = Image.open(img_path).convert("RGB")
-            img = np.array(img)
+            img = np.array(img, dtype=np.uint8)
         else:
+            # Fast in-place BGR→RGB conversion using cv2.cvtColor
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return img
 
@@ -122,7 +123,9 @@ class MultiLabelClassification(IterableDataset):
         
         for img_path in img_iter:
             img = self._load_image(img_path)
-            img = torch.from_numpy(img).permute(2, 0, 1).float()
+            # Use ascontiguousarray + permute in one go, then numpy directly
+            img = np.ascontiguousarray(img.transpose(2, 0, 1))
+            img = torch.from_numpy(img).float()
             
             if self.transforms:
                 img = self.transforms(img)
@@ -131,18 +134,6 @@ class MultiLabelClassification(IterableDataset):
 
 
 class InterleavedShuffleDataset(IterableDataset):
-    """
-    Interleaves multiple IterableDatasets round-robin, then applies buffer shuffle.
-
-    Solves two problems with plain ChainDataset:
-    1. Cross-dataset mixing: samples from different degradation types are interleaved,
-       preventing the model from seeing all-Blur then all-Rain (which causes loss spikes).
-    2. Within-shard shuffle: reservoir sampling shuffles the interleaved stream so the
-       model never sees the same ordering within an epoch.
-
-    Worker sharding: each sub-dataset's __iter__ reads worker_info and shards itself,
-    so no data is duplicated or lost across workers.
-    """
 
     def __init__(self, datasets, buffer_size: int = 2000, seed: int = 42):
         self.datasets = datasets
@@ -185,3 +176,83 @@ class InterleavedShuffleDataset(IterableDataset):
         rng.shuffle(indices)
         for i in indices:
             yield buffer[i]
+
+class PairedDataset(IterableDataset):
+    
+    def __init__(self, lq_path: str, hq_path: str,
+                 resolution: int = 1024,
+                 prompt: str = "",
+                 dataset_idx: int = 0,
+                 transforms=None):
+
+        super().__init__()
+        self.resolution = resolution
+        self.prompt = prompt
+        self.dataset_idx = dataset_idx  # 用于预计算 prompt embedding 缓存的索引
+        self.transforms = transforms
+
+        lq_path = os.path.abspath(lq_path)
+        hq_path = os.path.abspath(hq_path)
+
+        self.lq_dir = lq_path
+        self.hq_dir = hq_path
+
+        if not os.path.exists(self.lq_dir):
+            raise ValueError(f"LQ directory does not exist: {self.lq_dir}")
+        if not os.path.exists(self.hq_dir):
+            raise ValueError(f"HQ directory does not exist: {self.hq_dir}")
+
+        # Scan and match images
+        hq_files = {os.path.splitext(f)[0]: f for f in os.listdir(self.hq_dir)
+                   if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))}
+        lq_files = {os.path.splitext(f)[0]: f for f in os.listdir(self.lq_dir)
+                   if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))}
+
+        # Find common files
+        common_keys = sorted(set(hq_files.keys()) & set(lq_files.keys()))
+
+        self.pairs = [(os.path.join(self.hq_dir, hq_files[k]),
+                       os.path.join(self.lq_dir, lq_files[k]))
+                      for k in common_keys]
+
+    def _load_image(self, img_path):
+        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if img is None:
+            img = Image.open(img_path).convert("RGB")
+            img = np.array(img, dtype=np.uint8)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+
+        if worker_info is None:
+            pairs_iter = iter(self.pairs)
+        else:
+            per_worker = int(np.ceil(len(self.pairs) / worker_info.num_workers))
+            start = worker_info.id * per_worker
+            end = min(start + per_worker, len(self.pairs))
+            pairs_iter = iter(self.pairs[start:end])
+
+        for hq_path, lq_path in pairs_iter:
+            hq_image = self._load_image(hq_path)
+            lq_image = self._load_image(lq_path)
+
+            # Resize
+            hq_image = cv2.resize(hq_image, (self.resolution, self.resolution), interpolation=cv2.INTER_LINEAR)
+            lq_image = cv2.resize(lq_image, (self.resolution, self.resolution), interpolation=cv2.INTER_LINEAR)
+
+            # To tensor and normalize
+            hq_tensor = torch.from_numpy(hq_image.transpose(2, 0, 1)).float() / 255.0 * 2.0 - 1.0
+            lq_tensor = torch.from_numpy(lq_image.transpose(2, 0, 1)).float() / 255.0 * 2.0 - 1.0
+
+            yield {
+                "pixel_values": hq_tensor,
+                "conditioning_pixel_values": lq_tensor,
+                "captions": self.prompt,
+                "dataset_idx": self.dataset_idx,
+            }

@@ -1,0 +1,194 @@
+name: Flux_Image_Restoration
+seed: 42
+cudnn_benchmark: true
+
+# Logging configuration
+logging:
+  use_swanlab: true
+  swanlab_project: "Flux_Image_Restoration"
+  log_interval: 10
+
+# Accelerator configuration
+accelerator:
+  mixed_precision: "bf16"
+  project_dir: /home/yhmi/data/experiments
+  allow_tf32: true
+  report_to: "swanlab"
+
+# Data configuration
+data:
+  resolution: 384
+  embed_dir: /home/yhmi/cached_embeddings/
+  dataloader:
+    train:
+      batch_size: 128
+      num_workers: 12
+      pin_memory: true
+      persistent_workers: true
+      drop_last: true
+      prefetch_factor: 2
+
+    val:
+      batch_size: 1
+      num_workers: 8
+      pin_memory: true
+      persistent_workers: true
+      drop_last: false
+      prefetch_factor: 2
+
+  datasets:
+    # Training datasets
+    TrainDataset1:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/LQ_train
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
+      prompt: "remove blur from this image"
+
+    TrainDataset2:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/LQ_train
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/GT
+      prompt: "remove rain from this image"
+
+    TrainDataset3:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/LQ_train
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/GT
+      prompt: "remove haze from this image"
+
+    TrainDataset4:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/LQ_train
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/GT
+      prompt: "enhance low light in this image"
+
+    TrainDataset5:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/LQ_train
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/GT
+      prompt: "remove noise from this image"
+
+    TrainDataset6:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/02Blur_Noise/LQ_train
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/02Blur_Noise/GT
+      prompt: "remove blur and noise from this image"
+
+    TrainDataset7:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/LQ_train
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/GT
+      prompt: "enhance low light and remove haze from this image"
+
+    TrainDataset8:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/LQ_train
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/GT
+      prompt: "remove rain and haze from this image"
+
+    TrainDataset9:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/15Lowlight_Blur/LQ_train
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/15Lowlight_Blur/GT
+      prompt: "enhance low light and remove blur from this image"
+
+    TrainDataset10:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/LQ_train
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/GT
+      prompt: "enhance low light and remove noise from this image"
+
+    # Validation datasets
+    ValDataset1:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/LQ_val
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
+      prompt: "remove blur from this image"
+
+    ValDataset2:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/LQ_val
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/GT
+      prompt: "remove rain from this image"
+
+    ValDataset3:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/LQ_val
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/GT
+      prompt: "remove haze from this image"
+
+    ValDataset4:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/LQ_val
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/GT
+      prompt: "enhance low light in this image"
+
+    ValDataset5:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/LQ_val
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/GT
+      prompt: "remove noise from this image"
+
+    ValDataset6:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/02Blur_Noise/LQ_val
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/02Blur_Noise/GT
+      prompt: "remove blur and noise from this image"
+
+    ValDataset7:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/LQ_val
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/GT
+      prompt: "enhance low light and remove haze from this image"
+
+    ValDataset8:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/LQ_val
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/GT
+      prompt: "remove rain and haze from this image"
+
+    ValDataset9:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/15Lowlight_Blur/LQ_val
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/15Lowlight_Blur/GT
+      prompt: "enhance low light and remove blur from this image"
+
+    ValDataset10:
+      lq_path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/LQ_val
+      hq_path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/GT
+      prompt: "enhance low light and remove noise from this image"
+
+# Network 
+network:
+  pretrained_model_name_or_path: /home/yhmi/All_in_one/flux1-schnell
+  #variant: safetensors 
+  #revision: null
+  gradient_checkpointing: true
+  offload: false
+
+  # Degradation classifier
+  num_classes: 6
+  degradation_classifier_path: /home/yhmi/data/model/DegNet/best_model.pth
+  dino_type: /home/yhmi/data/model/dinov2-base
+
+# Training configuration
+train:
+  num_train_epochs: 10
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  proportion_empty_prompts: 0.0
+  fixed_timestep: 300
+  guidance_scale: 3.0
+
+  optim:
+    lr: 1e-4
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1e-8
+
+  scheduler:
+    type: "constant"
+    lr_warmup_steps: 500
+    lr_num_cycles: 1
+
+# Loss configuration
+loss:
+  weighting_scheme: "none"
+  logit_mean: 0.0
+  logit_std: 1.0
+  mode_scale: 1.29
+
+# Validation configuration
+val:
+  val_freq: 1
+  guidance_scale: 3.0
+  fixed_val_timestep: 300
+  max_val_samples: null
+
+# Output configuration
+output:
+  output_dir: /home/yhmi/data/experiments/flux_finetune
+  save_freq: 1
+  upcast_before_saving: false

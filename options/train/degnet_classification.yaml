@@ -1,10 +1,17 @@
 name: DegNet_CLIP_Classification
 seed: 42
-experiments_dir: /home/yhmi/data/experiments
+cudnn_benchmark: true
+
+logging:
+  use_swanlab: true
+  swanlab_project: "Train_FoundIR_MultiLabel_DegNetCLIP"
+  log_interval: 10
 
 accelerator:
+  use_swanlab: true
   mixed_precision: "no" # "no", "fp16", "bf16"
-  find_unused_parameters: False
+  find_unused_parameters: True
+  project_dir: /home/yhmi/data/experiments
 
 data:
   degradations: ['Blur', 'Noise', 'Clean', 'Haze', 'Rain', 'Lowlight']
@@ -180,7 +187,7 @@ network:
   freeze_encoder: False
 
 train:
-  num_epochs: 10
+  num_epochs: 15
   max_grad_norm: 1.0
   
   optim:
@@ -200,7 +207,4 @@ train:
 val:
   val_freq: 1
 
-logging:
-  use_swanlab: true
-  swanlab_project: "Train_FoundIR_MultiLabel_DegNetCLIP"
-  log_interval: 10
+
