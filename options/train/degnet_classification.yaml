@@ -3,14 +3,12 @@ seed: 42
 cudnn_benchmark: true
 
 logging:
-  use_swanlab: true
   swanlab_project: "Train_FoundIR_MultiLabel_DegNetCLIP"
   log_interval: 10
 
 accelerator:
-  use_swanlab: true
-  mixed_precision: "no" # "no", "fp16", "bf16"
-  find_unused_parameters: True
+  mixed_precision: "no"
+  find_unused_parameters: true
   project_dir: /home/yhmi/data/experiments
 
 data:
@@ -32,55 +30,43 @@ data:
       persistent_workers: true
       drop_last: false
       prefetch_factor: 2
-  
+
   datasets:
-    TrainDataset1: 
+    TrainDataset1:
       name: Blur
       degradation: Blur
       path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/LQ_train
       resize: 224
-      #use_hflip: true
-      #use_rot: true
-    
+
     TrainDataset2:
       name: Rain
       degradation: Rain
       path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/LQ_train
       resize: 224
-      #use_hflip: true
-      #use_rot: true
-      
+
     TrainDataset3:
       name: Haze
       degradation: Haze
       path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/LQ_train
       resize: 224
-      #use_hflip: true
-      #use_rot: true
-      
+
     TrainDataset4:
       name: Lowlight
       degradation: Lowlight
       path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/LQ_train
       resize: 224
-      #use_hflip: true
-      #use_rot: true
-      
+
     TrainDataset5:
       name: Noise
       degradation: Noise
       path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/LQ_train
       resize: 224
-      #use_hflip: true
-      #use_rot: true
-      
+
     TrainDataset6:
       name: Clean
       degradation: Clean
       path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
       resize: 224
-      #use_hflip: true
-      #use_rot: true
 
     TrainDataset7:
       name: Blur_Noise
@@ -148,7 +134,6 @@ data:
       path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
       resize: 224
 
-    # Second-order validation datasets
     ValDataset7:
       name: Blur_Noise
       degradation: [Blur, Noise]
@@ -178,23 +163,23 @@ data:
       degradation: [Lowlight, Noise]
       path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/LQ_val
       resize: 224
-  
+
 network:
-  type: DegNet_CLIP       
+  type: DegNet_CLIP
   backbone: /home/yhmi/data/model/clip-vit-base-patch32
   feature_dim: 512
-  num_classes: 6 # len of Degradations
-  freeze_encoder: False
+  num_classes: 6
+  freeze_encoder: false
 
 train:
   num_epochs: 15
   max_grad_norm: 1.0
-  
+
   optim:
     type: AdamW
     lr: 1e-4
     weight_decay: 0.01
-  
+
   scheduler:
     eta_min: 1e-6
 
@@ -206,5 +191,3 @@ train:
 
 val:
   val_freq: 1
-
-

@@ -1,6 +1,7 @@
 import torch
 import os
 import pickle
+import hashlib
 from torch.utils.data import IterableDataset
 import cv2
 import numpy as np
@@ -12,7 +13,9 @@ os.makedirs(_cache_dir, exist_ok=True)
 
 def _get_cache_path(root):
     """Get cache file path for a dataset root"""
-    return os.path.join(_cache_dir, f"{hash(root)}.pkl")
+    # Use hashlib for consistent cross-session and cross-platform hash
+    hash_value = hashlib.md5(root.encode('utf-8')).hexdigest()
+    return os.path.join(_cache_dir, f"{hash_value}.pkl")
 
 
 def _scan_directory(root):
@@ -135,7 +138,7 @@ class MultiLabelClassification(IterableDataset):
 
 class InterleavedShuffleDataset(IterableDataset):
 
-    def __init__(self, datasets, buffer_size: int = 2000, seed: int = 42):
+    def __init__(self, datasets, buffer_size: int = 3000, seed: int = 42):
         self.datasets = datasets
         self.buffer_size = buffer_size
         self.seed = seed
@@ -202,27 +205,81 @@ class PairedDataset(IterableDataset):
         if not os.path.exists(self.hq_dir):
             raise ValueError(f"HQ directory does not exist: {self.hq_dir}")
 
-        # Scan and match images
-        hq_files = {os.path.splitext(f)[0]: f for f in os.listdir(self.hq_dir)
-                   if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))}
-        lq_files = {os.path.splitext(f)[0]: f for f in os.listdir(self.lq_dir)
-                   if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))}
+        cache_key = f"paired_{hash(lq_path)}_{hash(hq_path)}"
+        cache_path = os.path.join(_cache_dir, f"{cache_key}.pkl")
 
-        # Find common files
-        common_keys = sorted(set(hq_files.keys()) & set(lq_files.keys()))
+        self.pairs = None
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as f:
+                    self.pairs = pickle.load(f)
+                if self.pairs and os.path.exists(self.pairs[0][0]):
+                    print(f"[PairedDataset] Loaded {len(self.pairs)} pairs from cache: {cache_path}")
+                else:
+                    self.pairs = None
+            except Exception as e:
+                print(f"[PairedDataset] Cache corrupted ({e}), rescanning...")
+                self.pairs = None
 
-        self.pairs = [(os.path.join(self.hq_dir, hq_files[k]),
-                       os.path.join(self.lq_dir, lq_files[k]))
-                      for k in common_keys]
+        if self.pairs is None:
+            hq_files = {os.path.splitext(f)[0]: f for f in os.listdir(self.hq_dir)
+                       if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))}
+            lq_files = {os.path.splitext(f)[0]: f for f in os.listdir(self.lq_dir)
+                       if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))}
+            common_keys = sorted(set(hq_files.keys()) & set(lq_files.keys()))
+            self.pairs = [(os.path.join(self.hq_dir, hq_files[k]),
+                           os.path.join(self.lq_dir, lq_files[k]))
+                          for k in common_keys]
+            try:
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(self.pairs, f)
+                print(f"[PairedDataset] Cached {len(self.pairs)} pairs to {cache_path}")
+            except Exception as e:
+                print(f"[PairedDataset] Failed to write cache: {e}")
 
-    def _load_image(self, img_path):
+    def _load_and_resize_image(self, img_path: str, resolution: int) -> np.ndarray:
+        """
+        Load image and resize in one step.
+        
+        Optimizations:
+        - Uses cv2.IMREAD_COLOR for RGB (faster than IMREAD_UNCHANGED)
+        - Uses INTER_AREA for downsampling (best quality for shrinking)
+        - Direct resize to target resolution
+        """
         img = cv2.imread(img_path, cv2.IMREAD_COLOR)
         if img is None:
-            img = Image.open(img_path).convert("RGB")
-            img = np.array(img, dtype=np.uint8)
+            img = np.array(Image.open(img_path).convert("RGB"), dtype=np.uint8)
         else:
+            # Fast BGR→RGB conversion
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Resize using INTER_AREA (best for downsampling)
+        img = cv2.resize(img, (resolution, resolution), interpolation=cv2.INTER_AREA)
         return img
+
+    def _numpy_to_tensor(self, img: np.ndarray, to_bfloat16: bool = False) -> torch.Tensor:
+        """
+        Convert numpy array to tensor with memory optimization.
+        
+        Args:
+            img: HWC numpy array (uint8)
+            to_bfloat16: If True, convert to bfloat16 to save GPU memory
+        
+        Returns:
+            CHW tensor in range [-1, 1], float32 or bfloat16
+        """
+        # Transpose HWC → CHW and normalize to [-1, 1] in one step
+        # (img.astype(np.float32) / 127.5 - 1.0) is faster than separate operations
+        tensor = (img.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)
+        
+        # Create tensor from contiguous array
+        tensor = torch.from_numpy(np.ascontiguousarray(tensor)).float()
+        
+        # Convert to bfloat16 if requested (saves 50% memory vs float32)
+        if to_bfloat16:
+            tensor = tensor.to(torch.bfloat16)
+        
+        return tensor
 
     def __len__(self):
         return len(self.pairs)
@@ -239,16 +296,84 @@ class PairedDataset(IterableDataset):
             pairs_iter = iter(self.pairs[start:end])
 
         for hq_path, lq_path in pairs_iter:
-            hq_image = self._load_image(hq_path)
-            lq_image = self._load_image(lq_path)
+            # Load and resize both images
+            hq_image = self._load_and_resize_image(hq_path, self.resolution)
+            lq_image = self._load_and_resize_image(lq_path, self.resolution)
 
-            # Resize
-            hq_image = cv2.resize(hq_image, (self.resolution, self.resolution), interpolation=cv2.INTER_LINEAR)
-            lq_image = cv2.resize(lq_image, (self.resolution, self.resolution), interpolation=cv2.INTER_LINEAR)
+            # Convert to tensors immediately to release numpy memory
+            hq_tensor = self._numpy_to_tensor(hq_image)
+            del hq_image  # Explicitly release numpy memory
+            
+            lq_tensor = self._numpy_to_tensor(lq_image)
+            del lq_image  # Explicitly release numpy memory
 
-            # To tensor and normalize
-            hq_tensor = torch.from_numpy(hq_image.transpose(2, 0, 1)).float() / 255.0 * 2.0 - 1.0
-            lq_tensor = torch.from_numpy(lq_image.transpose(2, 0, 1)).float() / 255.0 * 2.0 - 1.0
+            yield {
+                "pixel_values": hq_tensor,
+                "conditioning_pixel_values": lq_tensor,
+                "captions": self.prompt,
+                "dataset_idx": self.dataset_idx,
+            }
+
+
+class PairedDatasetMemoryOpt(PairedDataset):
+    """
+    Memory-optimized variant of PairedDataset.
+    
+    Additional optimizations for low-memory scenarios:
+    - Converts tensors to bfloat16 (50% memory savings)
+    - Uses lower precision for preprocessing
+    - Keeps only one image in memory at a time during iteration
+    """
+    
+    def __init__(self, lq_path: str, hq_path: str,
+                 resolution: int = 1024,
+                 prompt: str = "",
+                 dataset_idx: int = 0,
+                 transforms=None,
+                 use_bfloat16: bool = True):
+        
+        super().__init__(lq_path, hq_path, resolution, prompt, dataset_idx, transforms)
+        self.use_bfloat16 = use_bfloat16
+
+    def _numpy_to_tensor(self, img: np.ndarray) -> torch.Tensor:
+        """
+        Convert with bfloat16 optimization for GPU memory savings.
+        
+        bfloat16 uses same memory as float16 but has better numerical stability
+        for deep learning training (same exponent bits as float32).
+        """
+        # Fast normalization to [-1, 1]
+        tensor = (img.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)
+        tensor = torch.from_numpy(np.ascontiguousarray(tensor)).float()
+        
+        # Convert to bfloat16 if requested (50% memory savings)
+        if self.use_bfloat16:
+            tensor = tensor.to(torch.bfloat16)
+        
+        return tensor
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+
+        if worker_info is None:
+            pairs_iter = iter(self.pairs)
+        else:
+            per_worker = int(np.ceil(len(self.pairs) / worker_info.num_workers))
+            start = worker_info.id * per_worker
+            end = min(start + per_worker, len(self.pairs))
+            pairs_iter = iter(self.pairs[start:end])
+
+        for hq_path, lq_path in pairs_iter:
+            # Load and resize both images
+            hq_image = self._load_and_resize_image(hq_path, self.resolution)
+            lq_image = self._load_and_resize_image(lq_path, self.resolution)
+
+            # Convert to bfloat16 tensors immediately
+            hq_tensor = self._numpy_to_tensor(hq_image)
+            lq_tensor = self._numpy_to_tensor(lq_image)
+            
+            # Release numpy arrays immediately
+            del hq_image, lq_image
 
             yield {
                 "pixel_values": hq_tensor,

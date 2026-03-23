@@ -4,6 +4,15 @@ import torch
 from omegaconf import OmegaConf
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel
 
+def get_weight_dtype(mixed_precision):
+    """根据 mixed_precision 配置返回对应的 dtype"""
+    if mixed_precision == "bf16":
+        return torch.bfloat16
+    elif mixed_precision == "fp16":
+        return torch.float16
+    else:
+        return torch.float32
+
 def main(args):
     # 1. 加载配置
     config = OmegaConf.load(args.config)
@@ -11,7 +20,12 @@ def main(args):
     os.makedirs(save_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    weight_dtype = torch.float16  # 统一用 fp16 提取，既不损失精度又节省硬盘
+    
+    # 从配置文件读取 mixed_precision 设置，确保 embeddings dtype 与训练一致
+    mixed_precision = config.accelerator.get("mixed_precision", "no")
+    weight_dtype = get_weight_dtype(mixed_precision)
+    print(f"[Embedding] Using dtype: {weight_dtype}")
+    print(f"[Embedding] Mixed precision: {mixed_precision}")
 
     # 2. 从配置获取模型路径
     model_path = config.network.pretrained_model_name_or_path
@@ -46,7 +60,7 @@ def main(args):
             prompt = ds_cfg.get("prompt", "")
             print(f"[{ds_name} | idx: {ds_idx}] Extracting prompt: '{prompt}'")
             
-            # 编码 CLIP 特征
+            # 编码 CLIP 特征 (用于 pooled_prompt_embeds)
             text_inputs = tokenizer(
                 [prompt] if prompt else [""],
                 padding="max_length",
@@ -57,7 +71,7 @@ def main(args):
             text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
             pooled_prompt_embeds = text_encoder(**text_inputs).pooler_output
 
-            # 编码 T5 特征
+            # 编码 T5 特征 (用于 prompt_embeds) - Flux 使用 T5 作为主要文本编码器
             t5_inputs = tokenizer_2(
                 [prompt] if prompt else [""],
                 padding="max_length",
@@ -68,14 +82,17 @@ def main(args):
             t5_inputs = {k: v.to(device) for k, v in t5_inputs.items()}
             prompt_embeds = text_encoder_2(**t5_inputs).last_hidden_state
 
-            # 生成对应的 text_ids (Flux 架构所需)
+            # 生成对应的 text_ids，序列长度必须与 prompt_embeds 一致 (来自 T5)
+            # text_ids 的形状: [seq_len, 3]，用于 RoPE 的 x/y 坐标和类型标识
             text_ids = torch.zeros(prompt_embeds.shape[1], 3, device=device, dtype=weight_dtype)
 
             # 保存到硬盘
+            # 注意：prompt_embeds[0] 和 pooled_prompt_embeds[0] 是正确的（去掉 batch 维度=1）
+            # 但 text_ids 不应该取 [0]，因为 text_ids 已经是 [seq_len, 3] 的格式
             save_dict = {
                 "prompt_embeds": prompt_embeds[0].cpu(),
                 "pooled_prompt_embeds": pooled_prompt_embeds[0].cpu(),
-                "text_ids": text_ids[0].cpu()
+                "text_ids": text_ids.cpu()  # 修正：不要用 text_ids[0]！
             }
             save_path = os.path.join(save_dir, f"dataset_{ds_idx}_embeds.pt")
             torch.save(save_dict, save_path)

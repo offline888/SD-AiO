@@ -2,217 +2,128 @@ name: DegNet_DINO_Classification
 seed: 42
 experiments_dir: /home/yhmi/data/experiments
 
+logging:
+  swanlab_project: "Train_FoundIR_MultiLabel_DegNetDINO"
+  log_interval: 50
+
 accelerator:
-  mixed_precision: "no" # "no", "fp16", "bf16"
-  find_unused_parameters: False
+  mixed_precision: "no"
+  find_unused_parameters: false
 
 data:
-  degradations: ['Blur', 'Noise', 'Clean', 'Haze', 'Rain', 'Lowlight']
+  degradations: ['Clean', 'Haze', 'Rain', 'Lowlight']
 
   dataloader:
     train:
       batch_size: 128
-      num_workers: 8
+      num_workers: 4
       pin_memory: true
       persistent_workers: true
       drop_last: false
-      prefetch_factor: 2
+      prefetch_factor: 24
 
     val:
-      batch_size: 256
-      num_workers: 8
+      batch_size: 1
+      num_workers: 4
       pin_memory: true
       persistent_workers: true
       drop_last: false
-      prefetch_factor: 2
-  
+      prefetch_factor: 24
+
   datasets:
-    TrainDataset1: 
-      name: Blur
-      degradation: Blur
-      path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/LQ_train
-      resize: 224
-      use_hflip: true
-      #use_rot: true
-    
-    TrainDataset2:
+    TrainDataset1:
       name: Rain
       degradation: Rain
       path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/LQ_train
       resize: 224
-      use_hflip: true
-      #use_rot: true
-      
-    TrainDataset3:
+
+    TrainDataset2:
       name: Haze
       degradation: Haze
       path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/LQ_train
       resize: 224
-      use_hflip: true
-      #use_rot: true
-      
-    TrainDataset4:
+
+    TrainDataset3:
       name: Lowlight
       degradation: Lowlight
       path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/LQ_train
       resize: 224
-      use_hflip: true
-      #use_rot: true
-      
-    TrainDataset5:
-      name: Noise
-      degradation: Noise
-      path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/LQ_train
-      resize: 224
-      use_hflip: true
-      #use_rot: true
-      
-    TrainDataset6:
+
+    TrainDataset4:
       name: Clean
       degradation: Clean
       path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
       resize: 224
-      use_hflip: true
-      #use_rot: true
 
-    TrainDataset7:
-      name: Blur_Noise
-      degradation: [Blur, Noise]
-      path: /home/yhmi/data/Datadir/FoundIR_768/02Blur_Noise/LQ_train
-      resize: 224
-      use_hflip: true
-
-    TrainDataset8:
+    TrainDataset5:
       name: Lowlight_Haze
       degradation: [Lowlight, Haze]
       path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/LQ_train
       resize: 224
-      use_hflip: true
-    TrainDataset9:
+
+    TrainDataset6:
       name: Rain_Haze
       degradation: [Rain, Haze]
       path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/LQ_train
       resize: 224
-      use_hflip: true
-    TrainDataset10:
-      name: Lowlight_Blur
-      degradation: [Lowlight, Blur]
-      path: /home/yhmi/data/Datadir/FoundIR_768/15Lowlight_Blur/LQ_train
-      resize: 224
-      use_hflip: true
-    TrainDataset11:
-      name: Lowlight_Noise
-      degradation: [Lowlight, Noise]
-      path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/LQ_train
-      resize: 224
-      use_hflip: true
-
-    TrainDataset12:
-      name: Lowlight_Blur_Noise
-      degradation: [Lowlight, Blur, Noise]
-      path: /home/yhmi/data/Datadir/FoundIR_768/18Lowlight_Blur_Noise/LQ_train
-      resize: 224
-      use_hflip: true
 
     ValDataset1:
-      name: Blur
-      degradation: Blur
-      path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/LQ_val
-      resize: 224
-
-    ValDataset2:
       name: Rain
       degradation: Rain
       path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/LQ_val
       resize: 224
 
-    ValDataset3:
+    ValDataset2:
       name: Haze
       degradation: Haze
       path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/LQ_val
       resize: 224
 
-    ValDataset4:
+    ValDataset3:
       name: Lowlight
       degradation: Lowlight
       path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/LQ_val
       resize: 224
 
-    ValDataset5:
-      name: Noise
-      degradation: Noise
-      path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/LQ_val
-      resize: 224
-
-    ValDataset6:
+    ValDataset4:
       name: Clean
       degradation: Clean
       path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
       resize: 224
 
-    # Second-order validation datasets
-    ValDataset7:
-      name: Blur_Noise
-      degradation: [Blur, Noise]
-      path: /home/yhmi/data/Datadir/FoundIR_768/02Blur_Noise/LQ_val
-      resize: 224
-
-    ValDataset8:
+    ValDataset5:
       name: Lowlight_Haze
       degradation: [Lowlight, Haze]
       path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/LQ_val
       resize: 224
 
-    ValDataset9:
+    ValDataset6:
       name: Rain_Haze
       degradation: [Rain, Haze]
       path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/LQ_val
       resize: 224
 
-    ValDataset10:
-      name: Lowlight_Blur
-      degradation: [Lowlight, Blur]
-      path: /home/yhmi/data/Datadir/FoundIR_768/15Lowlight_Blur/LQ_val
-      resize: 224
-
-    ValDataset11:
-      name: Lowlight_Noise
-      degradation: [Lowlight, Noise]
-      path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/LQ_val
-      resize: 224
-
-    ValDataset12:
-      name: Lowlight_Blur_Noise
-      degradation: [Lowlight, Blur, Noise]
-      path: /home/yhmi/data/Datadir/FoundIR_768/18Lowlight_Blur_Noise/LQ_val
-      resize: 224
-  
 network:
   type: DegNet_DINO
   backbone: /home/yhmi/data/model/dinov2-base
   feature_dim: 512
-  num_classes: 6 # len of Degradations
-  freeze_encoder: False
+  num_classes: 4
+  freeze_encoder: false
   patch_size: 14
-  encoder_layer_index: 6
+  encoder_layer_index: 12
 
 train:
   num_epochs: 15
   max_grad_norm: 1.0
   save_freq: 1
-  
+
   optim:
     type: AdamW
     lr: 1e-4
     weight_decay: 0.01
-  
+
   scheduler:
     eta_min: 1e-6
 
 val:
   val_freq: 1
-
-logging:
-  use_swanlab: true
-  swanlab_project: "Train_FoundIR_MultiLabel_DegNetDINO"
-  log_interval: 10

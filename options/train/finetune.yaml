@@ -1,9 +1,9 @@
-name: Flux_Image_Restoration
+name: Flux_ImageRestoration_AdaLN
 seed: 42
 cudnn_benchmark: true
 
 logging:
-  swanlab_project: "Flux_Image_Restoration"
+  swanlab_project: "Flux_ImageRestoration"
   log_interval: 10
 
 accelerator:
@@ -17,7 +17,7 @@ data:
 
   dataloader:
     train:
-      batch_size: 32
+      batch_size: 16
       num_workers: 8
       pin_memory: true
       persistent_workers: true
@@ -34,110 +34,60 @@ data:
 
   datasets:
     TrainDataset1:
-      lq_path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/LQ_train
-      hq_path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
-      prompt: "remove blur from this image"
-
-    TrainDataset2:
       lq_path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/LQ_train
       hq_path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/GT
       prompt: "remove rain from this image"
 
-    TrainDataset3:
+    TrainDataset2:
       lq_path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/LQ_train
       hq_path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/GT
       prompt: "remove haze from this image"
 
-    TrainDataset4:
+    TrainDataset3:
       lq_path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/LQ_train
       hq_path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/GT
       prompt: "enhance low light in this image"
 
-    TrainDataset5:
-      lq_path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/LQ_train
-      hq_path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/GT
-      prompt: "remove noise from this image"
-
-    TrainDataset6:
-      lq_path: /home/yhmi/data/Datadir/FoundIR_768/02Blur_Noise/LQ_train
-      hq_path: /home/yhmi/data/Datadir/FoundIR_768/02Blur_Noise/GT
-      prompt: "remove blur and noise from this image"
-
-    TrainDataset7:
+    TrainDataset4:
       lq_path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/LQ_train
       hq_path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/GT
       prompt: "enhance low light and remove haze from this image"
 
-    TrainDataset8:
+    TrainDataset5:
       lq_path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/LQ_train
       hq_path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/GT
       prompt: "remove rain and haze from this image"
 
-    TrainDataset9:
-      lq_path: /home/yhmi/data/Datadir/FoundIR_768/15Lowlight_Blur/LQ_train
-      hq_path: /home/yhmi/data/Datadir/FoundIR_768/15Lowlight_Blur/GT
-      prompt: "enhance low light and remove blur from this image"
-
-    TrainDataset10:
-      lq_path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/LQ_train
-      hq_path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/GT
-      prompt: "enhance low light and remove noise from this image"
-
     ValDataset1:
-      lq_path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/LQ_val
-      hq_path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
-      prompt: "remove blur from this image"
-
-    ValDataset2:
       lq_path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/LQ_val
       hq_path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/GT
       prompt: "remove rain from this image"
 
-    ValDataset3:
+    ValDataset2:
       lq_path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/LQ_val
       hq_path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/GT
       prompt: "remove haze from this image"
 
-    ValDataset4:
+    ValDataset3:
       lq_path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/LQ_val
       hq_path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/GT
       prompt: "enhance low light in this image"
 
-    ValDataset5:
-      lq_path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/LQ_val
-      hq_path: /home/yhmi/data/Datadir/FoundIR_768/05Noise/GT
-      prompt: "remove noise from this image"
-
-    ValDataset6:
-      lq_path: /home/yhmi/data/Datadir/FoundIR_768/02Blur_Noise/LQ_val
-      hq_path: /home/yhmi/data/Datadir/FoundIR_768/02Blur_Noise/GT
-      prompt: "remove blur and noise from this image"
-
-    ValDataset7:
+    ValDataset4:
       lq_path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/LQ_val
       hq_path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/GT
       prompt: "enhance low light and remove haze from this image"
 
-    ValDataset8:
+    ValDataset5:
       lq_path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/LQ_val
       hq_path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/GT
       prompt: "remove rain and haze from this image"
-
-    ValDataset9:
-      lq_path: /home/yhmi/data/Datadir/FoundIR_768/15Lowlight_Blur/LQ_val
-      hq_path: /home/yhmi/data/Datadir/FoundIR_768/15Lowlight_Blur/GT
-      prompt: "enhance low light and remove blur from this image"
-
-    ValDataset10:
-      lq_path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/LQ_val
-      hq_path: /home/yhmi/data/Datadir/FoundIR_768/16Lowlight_Noise/GT
-      prompt: "enhance low light and remove noise from this image"
 
 network:
   pretrained_model_name_or_path: /home/yhmi/All_in_one/flux1-schnell
   gradient_checkpointing: true
   offload: true
-  num_classes: 6
+  num_classes: 5
   degradation_classifier_path: /home/yhmi/data/model/DegNet/best_model.pth
   dino_type: /home/yhmi/data/model/dinov2-base
 
@@ -157,9 +107,10 @@ train:
     epsilon: 1e-8
 
   scheduler:
-    type: "constant"
+    type: "cosine"
     lr_warmup_steps: 500
     lr_num_cycles: 1
+    lr_end: 1e-6
 
 loss:
   weighting_scheme: "none"

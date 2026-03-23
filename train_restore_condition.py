@@ -1,27 +1,19 @@
 import argparse
+import gc
 import logging
 import os
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-from datetime import datetime
-import gc
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
-
-from torch.utils.data import ChainDataset, DataLoader
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-
-from tqdm import tqdm
-import swanlab
-from PIL import Image
-from omegaconf import OmegaConf
-
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
-
 from diffusers import (
     AutoencoderKL,
     FlowMatchEulerDiscreteScheduler,
@@ -34,74 +26,89 @@ from diffusers.training_utils import (
     compute_loss_weighting_for_sd3,
     free_memory,
 )
+from omegaconf import OmegaConf
+from PIL import Image
+from torch.utils.data import ChainDataset, DataLoader
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from tqdm import tqdm
+
+import swanlab
 
 from src.data.dataset import InterleavedShuffleDataset, PairedDataset
 from src.networks.degnet import DegNet_DINO
 
-def encode_images(pixels: torch.Tensor, vae: torch.nn.Module, weight_dtype):
+
+def encode_images(
+    pixels: torch.Tensor,
+    vae: torch.nn.Module,
+    weight_dtype: torch.dtype
+) -> torch.Tensor:
     pixel_latents = vae.encode(pixels.to(vae.dtype)).latent_dist.sample()
     pixel_latents = (
         pixel_latents - vae.config.shift_factor
     ) * vae.config.scaling_factor
     return pixel_latents.to(weight_dtype)
 
-class Trainer:
 
-    def __init__(self, args):
+class ConditionTrainer:
+    def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.config = OmegaConf.load(args.config)
 
-        self.exp_name = self.config.get("name", "flux_schnell_restore")
+        self.exp_name = self.config.get("name", "flux_condition_finetune")
         self.exp_name = f"{self.exp_name}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
         set_seed(self.config.seed)
 
-        self.num_classes = self.config.network.get("num_classes", 6)
-        self.current_epoch = 0
-        self.global_step = 0
+        self.num_classes: int = self.config.network.get("num_classes", 5)
+        self.current_epoch: int = 0
+        self.global_step: int = 0
 
-        self.logger = logging.getLogger(__name__)
+        self.accelerator: Optional[Accelerator] = None
+        self.is_main: bool = False
+        self.unwrap_fn: Optional[callable] = None
 
-        self.accelerator = None
-        self.vae = None
-        self.transformer = None
-        self.noise_scheduler = None
-        self.optimizer = None
-        self.scheduler = None
-        self.train_dataloader = None
-        self.weight_dtype = None
-        self.vae_scale_factor = None
+        self.vae: Optional[AutoencoderKL] = None
+        self.transformer: Optional[FluxTransformer2DModel] = None
+        self.noise_scheduler: Optional[FlowMatchEulerDiscreteScheduler] = None
+        self.optimizer: Optional[torch.optim.Optimizer] = None
+        self.scheduler: Optional[Any] = None
+        self.train_dataloader: Optional[DataLoader] = None
+        self.val_dataloader: Optional[DataLoader] = None
+        self.weight_dtype: Optional[torch.dtype] = None
+        self.vae_scale_factor: Optional[int] = None
 
-        self.train_datasets = []
-        self.val_datasets = []
-        self.prompt_embed_cache = {}
+        self.train_datasets: List[Any] = []
+        self.val_datasets: List[Any] = []
+        self.prompt_embed_cache: Dict[int, Tuple[Any, Any, Any]] = {}
 
         self.deg_classifier = DegNet_DINO(
             dino_type=self.config.network.get("dino_type", None)
         )
-        self.deg_classifier.load_state_dict(torch.load(self.config.network.degradation_classifier_path))
+        self.deg_classifier.load_state_dict(
+            torch.load(self.config.network.degradation_classifier_path, map_location="cpu"),
+            strict=False
+        )
 
-        self.output_dir = None
-        self.ckpt_dir = None
-        self.log_dir = None
+        self.output_dir: Optional[str] = None
+        self.ckpt_dir: Optional[str] = None
+        self.log_dir: Optional[str] = None
 
-    def setup_dist(self):
+        self.logger = logging.getLogger(__name__)
+
+    def setup_dist(self) -> None:
         ddp_kwargs = DistributedDataParallelKwargs(
             find_unused_parameters=self.config.accelerator.get(
                 "find_unused_parameters", False
             )
         )
 
-        log_with = self.config.accelerator.get("report_to", "tensorboard")
-        if self.config.logging.get("use_swanlab", False):
-            log_with = "swanlab"
-
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.config.train.get(
-                "gradient_accumulation_steps", 1
+                "gradient_accumulation_steps", 4
             ),
-            mixed_precision=self.config.accelerator.get("mixed_precision", "no"),
-            log_with=log_with,
+            mixed_precision=self.config.accelerator.get("mixed_precision", "bf16"),
+            log_with="swanlab",
             project_dir=self.config.accelerator.get("project_dir", "./experiments"),
             kwargs_handlers=[ddp_kwargs],
         )
@@ -109,7 +116,7 @@ class Trainer:
         self.is_main = self.accelerator.is_main_process
         self.unwrap_fn = self.accelerator.unwrap_model
 
-    def init_logger(self):
+    def init_logger(self) -> None:
         self.output_dir = os.path.join(
             self.config.accelerator.get("project_dir", "./experiments"), self.exp_name
         )
@@ -117,39 +124,32 @@ class Trainer:
 
         if self.is_main:
             os.makedirs(self.ckpt_dir, exist_ok=True)
-
             config_save_path = os.path.join(self.output_dir, "config.yaml")
             OmegaConf.save(self.config, config_save_path)
-            print(f"[Config] Saved to {config_save_path}")
 
-        if self.config.logging.get("use_swanlab", False):
-            swanlab_config = OmegaConf.to_container(self.config)
-            self.log_dir = os.path.join(self.output_dir, "logs")
-            os.makedirs(self.log_dir, exist_ok=True)
-            swanlab_config["log_dir"] = self.log_dir
+        swanlab_config = OmegaConf.to_container(self.config)
+        self.log_dir = os.path.join(self.output_dir, "logs")
+        os.makedirs(self.log_dir, exist_ok=True)
+        swanlab_config["log_dir"] = self.log_dir
 
-            init_kwargs = {
-                "swanlab": {
-                    "experiment_name": self.exp_name,
-                    "log_dir": self.log_dir,
-                }
+        init_kwargs = {
+            "swanlab": {
+                "experiment_name": self.exp_name,
+                "log_dir": self.log_dir,
             }
-            self.accelerator.init_trackers(
-                project_name=self.config.logging.swanlab_project,
-                config=swanlab_config,
-                init_kwargs=init_kwargs,
-            )
-        else:
-            self.accelerator.init_trackers(
-                project_name=self.config.logging.get("swanlab_project", "experiment")
-            )
+        }
+        self.accelerator.init_trackers(
+            project_name=self.config.logging.swanlab_project,
+            config=swanlab_config,
+            init_kwargs=init_kwargs,
+        )
 
-    def build_models(self):
+    def build_models(self) -> None:
         model_path = self.config.network.pretrained_model_name_or_path
 
         precisions = {"fp16": torch.float16, "bf16": torch.bfloat16}
         self.weight_dtype = precisions.get(
-            self.config.accelerator.get("mixed_precision", "no"), torch.float32
+            self.config.accelerator.get("mixed_precision", "bf16"), torch.float32
         )
 
         self.vae = AutoencoderKL.from_pretrained(
@@ -162,7 +162,6 @@ class Trainer:
         self.vae.requires_grad_(False)
         self.vae.enable_tiling()
 
-        # For Flux VAE with block_out_channels=[128, 256, 512, 512], this gives 8
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
         self.transformer = FluxTransformer2DModel.from_pretrained(
@@ -172,15 +171,13 @@ class Trainer:
             variant=self.config.network.get("variant"),
             torch_dtype=self.weight_dtype,
         )
-        self.transformer.requires_grad_(True)
+        self.transformer.requires_grad_(False)
 
         self.transformer.register_parameter(
             "class_embedding_U",
             nn.Parameter(torch.randn(self.num_classes, 768), requires_grad=True)
         )
         nn.init.orthogonal_(self.transformer.class_embedding_U)
-        
-        # Save a complete copy BEFORE FSDP prepare() - will be used in extract_deg_feat()
         self._class_embedding_U_cpu = self.transformer.class_embedding_U.data.clone().cpu()
 
         self.noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -189,18 +186,15 @@ class Trainer:
         )
 
         self.fixed_timestep = self.config.train.get("fixed_timestep", None)
-        if self.fixed_timestep is not None:
-            print(f"[Trainer] Using fixed timestep: {self.fixed_timestep}")
-
-        self.vae.to(dtype=torch.float32)
-        self.transformer.to(dtype=self.weight_dtype)
 
         if self.config.network.get("gradient_checkpointing", False):
             self.transformer.enable_gradient_checkpointing()
+        self.vae.to(dtype=torch.float32)
+        self.transformer.to(dtype=self.weight_dtype)
         if self.config.accelerator.get("allow_tf32", False):
             torch.backends.cuda.matmul.allow_tf32 = True
 
-    def extract_deg_feat(self, lq_images):
+    def extract_deg_feat(self, lq_images: torch.Tensor) -> torch.Tensor:
         self.deg_classifier.to(self.accelerator.device)
         self.deg_classifier.eval()
 
@@ -212,12 +206,11 @@ class Trainer:
         class_emb_U = self._class_embedding_U_full
         deg_feat = probs @ class_emb_U
 
-        # Offload deg_classifier back to CPU to free GPU memory
         self.deg_classifier.cpu()
 
         return deg_feat
 
-    def build_dataloader(self):
+    def build_dataloader(self) -> None:
         resolution = self.config.data.resolution
         datasets_cfg = self.config.data.get("datasets", {})
 
@@ -243,6 +236,8 @@ class Trainer:
         self.val_datasets = val_datasets
 
         train_loader_cfg = self.config.data.dataloader.train
+        batch_size = train_loader_cfg.batch_size
+
         if len(train_datasets) > 1:
             self.train_dataloader = DataLoader(
                 InterleavedShuffleDataset(
@@ -250,8 +245,8 @@ class Trainer:
                 ),
                 shuffle=False,
                 collate_fn=self.collate_fn,
-                batch_size=train_loader_cfg.batch_size,
-                num_workers=train_loader_cfg.get("num_workers", 4),
+                batch_size=batch_size,
+                num_workers=train_loader_cfg.get("num_workers", 2),
                 pin_memory=train_loader_cfg.get("pin_memory", True),
                 persistent_workers=train_loader_cfg.get("persistent_workers", True),
                 drop_last=train_loader_cfg.get("drop_last", True),
@@ -260,8 +255,8 @@ class Trainer:
             self.train_dataloader = DataLoader(
                 train_datasets[0],
                 collate_fn=self.collate_fn,
-                batch_size=train_loader_cfg.batch_size,
-                num_workers=train_loader_cfg.get("num_workers", 4),
+                batch_size=batch_size,
+                num_workers=train_loader_cfg.get("num_workers", 2),
                 pin_memory=train_loader_cfg.get("pin_memory", True),
                 persistent_workers=train_loader_cfg.get("persistent_workers", True),
                 drop_last=train_loader_cfg.get("drop_last", True),
@@ -273,8 +268,8 @@ class Trainer:
                 ChainDataset(val_datasets),
                 shuffle=False,
                 collate_fn=self.collate_fn,
-                batch_size=val_loader_cfg.batch_size,
-                num_workers=val_loader_cfg.get("num_workers", 4),
+                batch_size=val_loader_cfg.get("batch_size", 1),
+                num_workers=val_loader_cfg.get("num_workers", 2),
                 pin_memory=val_loader_cfg.get("pin_memory", True),
                 persistent_workers=val_loader_cfg.get("persistent_workers", True),
                 drop_last=val_loader_cfg.get("drop_last", False),
@@ -283,7 +278,7 @@ class Trainer:
             self.val_dataloader = None
 
     @staticmethod
-    def collate_fn(examples):
+    def collate_fn(examples: List[Dict[str, Any]]) -> Dict[str, Any]:
         pixel_values = torch.stack([e["pixel_values"] for e in examples])
         cond_pixel_values = torch.stack(
             [e["conditioning_pixel_values"] for e in examples]
@@ -297,16 +292,36 @@ class Trainer:
             "dataset_indices": dataset_indices,
         }
 
-    def setup_optimization(self):
+    def setup_optimization(self) -> None:
         opt_cfg = self.config.train.optim
 
-        trainable_params = [p for p in self.transformer.parameters() if p.requires_grad]
+        decay_params = []
+        no_decay_params = []
+
+        for name, param in self.transformer.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "class_embedding_U" in name:
+                decay_params.append(param)
+            else:
+                no_decay_params.append(param)
+
+        trainable_params_set = set(decay_params) | set(no_decay_params)
+        all_trainable = {p for p in self.transformer.parameters() if p.requires_grad}
+        assert trainable_params_set == all_trainable, (
+            f"Parameter mismatch: trainable={len(all_trainable)}, grouped={len(trainable_params_set)}"
+        )
+
+        wd = opt_cfg.get("weight_decay", 0.01)
+        param_groups = [
+            {"params": decay_params, "weight_decay": wd},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
 
         self.optimizer = torch.optim.AdamW(
-            trainable_params,
+            param_groups,
             lr=opt_cfg.get("lr", 1e-4),
             betas=(opt_cfg.get("beta1", 0.9), opt_cfg.get("beta2", 0.999)),
-            weight_decay=opt_cfg.get("weight_decay", 0.01),
             eps=opt_cfg.get("epsilon", 1e-8),
         )
 
@@ -315,36 +330,40 @@ class Trainer:
             len(self.train_dataloader) // self.accelerator.gradient_accumulation_steps
         ) * self.config.train.num_train_epochs
 
-        self.scheduler = get_scheduler(
-            scheduler_cfg.type,
-            optimizer=self.optimizer,
-            num_warmup_steps=scheduler_cfg.get("lr_warmup_steps", 500),
-            num_training_steps=num_training_steps,
-            num_cycles=scheduler_cfg.get("lr_num_cycles", 1),
-        )
+        scheduler_kwargs = {
+            "optimizer": self.optimizer,
+            "num_warmup_steps": scheduler_cfg.get("lr_warmup_steps", 100),
+            "num_training_steps": num_training_steps,
+            "num_cycles": scheduler_cfg.get("lr_num_cycles", 1),
+        }
+
+        lr_end = scheduler_cfg.get("lr_end")
+        if lr_end is not None:
+            scheduler_kwargs["lr_end"] = lr_end
+
+        self.scheduler = get_scheduler(scheduler_cfg.type, **scheduler_kwargs)
 
         self.transformer, self.optimizer, self.train_dataloader, self.scheduler = (
             self.accelerator.prepare(
                 self.transformer, self.optimizer, self.train_dataloader, self.scheduler
             )
         )
-        # Move the pre-captured class_embedding_U to GPU with correct dtype
-        self._class_embedding_U_full = self._class_embedding_U_cpu.to(self.accelerator.device, dtype=self.weight_dtype)
 
-        # Only move VAE to GPU if offload is disabled (otherwise manage it in training loop)
+        self._class_embedding_U_full = self._class_embedding_U_cpu.to(
+            self.accelerator.device, dtype=self.weight_dtype
+        )
+
         if not self.config.network.get("offload", False):
             self.vae = self.vae.to(self.accelerator.device)
 
-        # 直接读取预处理好的 prompt embeddings
         self._precompute_prompt_embeddings()
 
         gc.collect()
         torch.cuda.empty_cache()
 
-    def _precompute_prompt_embeddings(self):
-        # 从配置中获取目录，如果没有则使用默认目录
+    def _precompute_prompt_embeddings(self) -> None:
         embed_dir = self.config.data.get("embed_dir", "./cached_embeddings")
-        
+
         datasets = self.train_datasets + self.val_datasets
         unique_dataset_idx = set([ds.dataset_idx for ds in datasets])
 
@@ -354,24 +373,22 @@ class Trainer:
 
             load_path = os.path.join(embed_dir, f"dataset_{ds_idx}_embeds.pt")
             if not os.path.exists(load_path):
-                raise FileNotFoundError(f"找不到预计算的特征文件: {load_path}. 请先运行提取脚本。")
-            
-            # 读取特征并存放在 CPU 上，随用随取
+                raise FileNotFoundError(
+                    f"找不到预计算的 prompt embedding 文件: {load_path}，"
+                    "请先运行 embedding 提取脚本。"
+                )
+
             loaded_data = torch.load(load_path, map_location="cpu", weights_only=True)
-            
+
             self.prompt_embed_cache[ds_idx] = (
                 loaded_data["prompt_embeds"],
                 loaded_data["pooled_prompt_embeds"],
                 loaded_data["text_ids"]
             )
-            
-            if self.is_main:
-                print(f"  [Cache] dataset_idx={ds_idx} 成功加载硬盘缓存.")
 
-        if self.is_main:
-            print(f"[PromptCache] 共加载 {len(self.prompt_embed_cache)} 个 prompt embeddings")
-
-    def _get_prompt_embeds_from_cache(self, dataset_indices):
+    def _get_prompt_embeds_from_cache(
+        self, dataset_indices: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = self.accelerator.device
 
         prompt_embeds_list = []
@@ -382,26 +399,22 @@ class Trainer:
             p_embed, pooled, txt_ids = self.prompt_embed_cache[int(idx)]
             prompt_embeds_list.append(p_embed.to(device, dtype=self.weight_dtype))
             pooled_list.append(pooled.to(device, dtype=self.weight_dtype))
-            # text_ids 已经是 [seq_len, 3] 格式，不需要 stack（每个样本的 prompt 相同）
             text_ids_list.append(txt_ids)
 
         prompt_embeds = torch.stack(prompt_embeds_list)
         pooled_prompt_embeds = torch.stack(pooled_list)
-        # text_ids 对所有样本都是相同的，直接使用第一个（已经是 2D [seq_len, 3]）
         text_ids = text_ids_list[0].to(device, dtype=self.weight_dtype)
 
         return prompt_embeds, pooled_prompt_embeds, text_ids
 
-    def training_step(self, batch):
+    def training_step(self, batch: Dict[str, Any]) -> torch.Tensor:
         with self.accelerator.accumulate(self.transformer):
-            # Re-onload VAE before encoding (offloaded after previous step)
             if self.config.network.get("offload", False):
                 self.vae.to(self.accelerator.device)
 
             hq_latents = encode_images(batch["pixel_values"], self.vae, self.weight_dtype)
             lq_latents = encode_images(batch["conditioning_pixel_values"], self.vae, self.weight_dtype)
 
-            # Offload VAE to CPU immediately after encoding to free GPU memory during transformer forward
             if self.config.network.get("offload", False):
                 self.vae.cpu()
                 torch.cuda.empty_cache()
@@ -429,16 +442,14 @@ class Trainer:
                     logit_std=self.config.loss.get("logit_std", 1.0),
                     mode_scale=self.config.loss.get("mode_scale", 1.29),
                 )
-
-                # 直接使用 self.noise_scheduler，不深拷贝（节省大量内存）
                 indices = (density * self.noise_scheduler.config.num_train_timesteps).long()
                 timesteps = self.noise_scheduler.timesteps[indices].to(
                     device=lq_latents.device, dtype=lq_latents.dtype
                 )
-
                 sigmas = self._get_sigmas(
                     timesteps, n_dim=lq_latents.ndim, dtype=lq_latents.dtype
                 )
+
             noisy_input = (1.0 - sigmas) * lq_latents + sigmas * noise
 
             packed_input = FluxImg2ImgPipeline._pack_latents(
@@ -460,7 +471,7 @@ class Trainer:
             if self.unwrap_fn(self.transformer).config.guidance_embeds:
                 guidance = torch.full(
                     (batchsize,),
-                    self.config.train.get("guidance_scale", 30.0),
+                    self.config.train.get("guidance_scale", 3.0),
                     device=noisy_input.device,
                     dtype=self.weight_dtype,
                 )
@@ -522,8 +533,6 @@ class Trainer:
             self.scheduler.step()
             self.optimizer.zero_grad()
 
-            # VAE will be re-onloaded at the beginning of next step (if offload is enabled)
-
             if self.accelerator.sync_gradients:
                 self.global_step += 1
                 log_interval = self.config.logging.get("log_interval", 10)
@@ -538,7 +547,12 @@ class Trainer:
 
             return loss
 
-    def _get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
+    def _get_sigmas(
+        self,
+        timesteps: torch.Tensor,
+        n_dim: int = 4,
+        dtype: torch.dtype = torch.float32
+    ) -> torch.Tensor:
         sigmas = self.noise_scheduler.sigmas.to(
             device=self.accelerator.device, dtype=dtype
         )
@@ -550,16 +564,15 @@ class Trainer:
         return sigma
 
     @torch.no_grad()
-    def validation(self):
+    def validation(self) -> Optional[Dict[str, Any]]:
         if self.val_dataloader is None:
-            self.logger.info("No validation dataloader, skipping validation...")
             return None
 
-        self.logger.info("Running single-step validation...")
+        if self.config.network.get("offload", False):
+            self.vae.to(self.accelerator.device)
 
-        guidance_scale = self.config.val.get("guidance_scale", 30.0)
-        fixed_val_timestep = self.config.val.get("fixed_val_timestep", 1.0)
-        print(f"[Validation] Using single-step inference with timestep: {fixed_val_timestep}")
+        guidance_scale = self.config.val.get("guidance_scale", 3.0)
+        fixed_val_timestep = self.config.val.get("fixed_val_timestep", 300)
 
         ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.accelerator.device)
         psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(self.accelerator.device)
@@ -570,11 +583,9 @@ class Trainer:
 
         to_tensor = transforms.ToTensor()
 
+        max_val_samples = self.config.val.get("max_val_samples")
         for batch_idx, batch in enumerate(self.val_dataloader):
-            if (
-                self.config.val.get("max_val_samples")
-                and batch_idx >= self.config.val.max_val_samples
-            ):
+            if max_val_samples and batch_idx >= max_val_samples:
                 break
 
             pixel_values = batch["pixel_values"].to(self.accelerator.device)
@@ -673,8 +684,6 @@ class Trainer:
         avg_ssim = sum(all_ssim) / len(all_ssim) if all_ssim else None
         avg_psnr = sum(all_psnr) / len(all_psnr) if all_psnr else None
 
-        self.logger.info(f"Validation SSIM: {avg_ssim:.4f}, PSNR: {avg_psnr:.2f}")
-
         if self.is_main:
             val_metrics = {}
             if avg_ssim is not None:
@@ -685,16 +694,15 @@ class Trainer:
             if val_metrics:
                 self.accelerator.log(val_metrics, step=self.global_step)
 
-        if self.config.logging.get("use_swanlab", False) and self.is_main:
-            for log in image_logs:
-                self.accelerator.log(
-                    {"validation/input": swanlab.Image(log["validation_image"], caption=log.get("validation_prompt", ""))},
-                    step=self.global_step,
-                )
-                self.accelerator.log(
-                    {"validation/output": swanlab.Image(log["images"][0], caption=log.get("validation_prompt", ""))},
-                    step=self.global_step,
-                )
+        for log in image_logs:
+            self.accelerator.log(
+                {"validation/input": swanlab.Image(log["validation_image"], caption=log.get("validation_prompt", ""))},
+                step=self.global_step,
+            )
+            self.accelerator.log(
+                {"validation/output": swanlab.Image(log["images"][0], caption=log.get("validation_prompt", ""))},
+                step=self.global_step,
+            )
 
         free_memory()
 
@@ -702,17 +710,28 @@ class Trainer:
             return {"image_logs": image_logs, "ssim": avg_ssim, "psnr": avg_psnr}
         return image_logs
 
-    def save_ckpt(self, is_best=False):
+    def save_ckpt(self, is_best: bool = False, non_blocking: bool = True) -> None:
         unwrapped = self.unwrap_fn(self.transformer)
 
-        if self.config.output.get("upcast_before_saving", False):
-            unwrapped.to(torch.float32)
         filename = "best_model" if is_best else f"step_{self.global_step}"
         save_path = os.path.join(self.ckpt_dir, filename)
-        unwrapped.save_pretrained(save_path)
-        print(f"[Checkpoint] Saved to {save_path}")
 
-    def train(self):
+        class_emb_state = unwrapped.class_embedding_U.state_dict()
+
+        os.makedirs(save_path, exist_ok=True)
+
+        def _do_save():
+            class_emb_path = os.path.join(save_path, "class_embedding_U.pt")
+            torch.save(class_emb_state, class_emb_path)
+
+        if non_blocking:
+            import threading
+            t = threading.Thread(target=_do_save, name=f"ckpt-save-{self.global_step}")
+            t.start()
+        else:
+            _do_save()
+
+    def train(self) -> None:
         self.setup_dist()
         self.init_logger()
         self.build_models()
@@ -755,6 +774,9 @@ class Trainer:
                     print("\n" + "=" * 60)
                     print(f"Epoch {self.current_epoch} Validation")
                     print("=" * 60)
+                    if image_logs.get("ssim") is not None:
+                        print(f"SSIM: {image_logs['ssim']:.4f} | PSNR: {image_logs['psnr']:.2f}")
+                    print("=" * 60)
 
             save_freq = self.config.train.get("save_freq", 1)
             if self.is_main and (epoch + 1) % save_freq == 0:
@@ -766,12 +788,19 @@ class Trainer:
         self.accelerator.end_training()
 
 
-if __name__ == "__main__":
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-c", "--config", type=str, required=True, help="Path to YAML config"
+    parser.add_argument("-c", "--config", type=str, required=True)
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    args = parser.parse_args()
-    trainer = Trainer(args)
+    trainer = ConditionTrainer(args)
     trainer.train()
+
+
+if __name__ == "__main__":
+    main()
