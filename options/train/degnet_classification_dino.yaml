@@ -39,7 +39,7 @@ data:
 
     TrainDataset2:
       name: Haze
-      degradation: Haze
+      degradation: Haze·
       path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/LQ_train
       resize: 224
 

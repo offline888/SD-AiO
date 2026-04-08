@@ -1,78 +1,81 @@
-name: Flux_ImageRestoration_AdaLN
+name: Flux2_Klein_ImageRestoration_AdaLN
 seed: 42
-cudnn_benchmark: true
-
-logging:
-  swanlab_project: "Flux_ImageRestoration"
-  log_interval: 10
 
 accelerator:
-  mixed_precision: "bf16"
-  project_dir: /home/yhmi/data/experiments
-  allow_tf32: true
-  deepspeed_config:
-    gradient_accumulation_steps: 8
-    zero3_init_flag: true
-    stage3_param_persistence_threshold: 1e4
-    stage3_gather_16bit_weights_on_model_save: true
-    stage3_sub_group_size: 1e8
-    stage3_max_live_parameters: 1e9
-    stage3_prefetch_bucket_size: 1e6
-    stage3_model_autotune: true
-    reduce_bucket_size: 1e6
-    stage3_bucket_usage: 0.9
+  # set accelerator config
+  # if not set, use default config in .cache/huggingface/accelerate
+  gradient_accumulation_steps: 4
+  mixed_precision: bf16
+  log_with : swanlab
+  project_dir : /home/yhmi/data/FLUX2Klein_IR_Finetune
+
+logger:
+  project: Flux2_Klein_ImageRestoration
+  log_interval: 100  
+
+network:
+  model_path: /home/yhmi/data/model/flux.2-klein
+  degradation_classifier_path: /home/yhmi/data/model/best_model.pth
+  dino_type: /home/yhmi/data/model/dinov2-base
+
+  num_classes: 4
+  deg_names: ["Clean", "Haze", "Rain", "Lowlight"]   # order matches dataset class indices
+  offload: false
+  unfreeze_adaln_type: all   # double | single | all
+
+train:
+  num_train_iters: 50001
+  max_grad_norm: 1.0
+  fixed_timestep: 300
+  # resume_exp_dir: Flux2_Klein_ImageRestoration_AdaLN_20260326-214447  # 实验目录名（从 experiments/ 下选择）
+  # resume_from: iter_30000  # checkpoint 文件夹名（如 iter_5000, epoch_003 等）
 
 data:
   resolution: 512
-  embed_dir: /home/yhmi/cached_embeddings/
+  embed_dir: /home/yhmi/data/cached_embeddings
 
   dataloader:
     train:
-      batch_size: 1
+      batch_size: 4
       num_workers: 16
       pin_memory: true
       persistent_workers: true
       drop_last: true
-      prefetch_factor: 4
+      prefetch_factor: 3
 
     val:
-      batch_size: 1
+      batch_size: 8
       num_workers: 16
       pin_memory: true
       persistent_workers: true
       drop_last: false
-      prefetch_factor: 4
+      prefetch_factor: 2
 
   datasets:
     TrainDataset1:
       lq_path: /home/yhmi/data/patches/10Rain/LQ_train
       hq_path: /home/yhmi/data/patches/10Rain/GT
       prompt: "remove rain from this image"
-      enlarge_ratio: 2.0
 
     TrainDataset2:
       lq_path: /home/yhmi/data/patches/08Haze/LQ_train
       hq_path: /home/yhmi/data/patches/08Haze/GT
       prompt: "remove haze from this image"
-      enlarge_ratio: 1.0
 
     TrainDataset3:
       lq_path: /home/yhmi/data/patches/14Lowlight/LQ_train
       hq_path: /home/yhmi/data/patches/14Lowlight/GT
       prompt: "enhance low light in this image"
-      enlarge_ratio: 2.0
 
     TrainDataset4:
       lq_path: /home/yhmi/data/patches/09Lowlight_Haze/LQ_train
       hq_path: /home/yhmi/data/patches/09Lowlight_Haze/GT
       prompt: "enhance low light and remove haze from this image"
-      enlarge_ratio: 1.0
 
     TrainDataset5:
       lq_path: /home/yhmi/data/patches/13Rain_Haze/LQ_train
       hq_path: /home/yhmi/data/patches/13Rain_Haze/GT
       prompt: "remove rain and haze from this image"
-      enlarge_ratio: 1.0
 
     ValDataset1:
       lq_path: /home/yhmi/data/patches/10Rain/LQ_val
@@ -99,50 +102,26 @@ data:
       hq_path: /home/yhmi/data/patches/13Rain_Haze/GT
       prompt: "remove rain and haze from this image"
 
-network:
-  pretrained_model_name_or_path: /home/yhmi/All_in_one/flux1-schnell
-  gradient_checkpointing: false
-  offload: false
-  num_classes: 4
-  degradation_classifier_path: /home/yhmi/data/model/best_model.pth
-  dino_type: /home/yhmi/data/model/dinov2-base
-  unfreeze_adaln: true
+optim:
+  lr: 1e-4
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  epsilon: 1e-8
 
-train:
-  num_train_epochs: 3
-  max_grad_norm: 1.0
-  gradient_accumulation_steps: 8
-  proportion_empty_prompts: 0.0
-  fixed_timestep: 300
-  guidance_scale: 3.0
-
-  optim:
-    lr: 1e-4
-    weight_decay: 0.01
-    beta1: 0.9
-    beta2: 0.999
-    epsilon: 1e-8
-
-  scheduler:
-    type: "cosine"
-    lr_warmup_steps: 5000
-    lr_num_cycles: 2
+scheduler:
+  type: "cosine"
+  lr_warmup_steps: 2000
+  lr_num_cycles: 2
+#    lr_end: 1e-6
 
 loss:
   weighting_scheme: "none"
-  logit_mean: 0.0
-  logit_std: 1.0
-  mode_scale: 1.29
 
 val:
-  val_freq: 1
-  val_freq_iters: 500
-  num_vis_samples: 5    
+  skip_init_val: false
+  val_freq_iters: 10000
+  num_vis_samples: 20
   guidance_scale: 3.0
-  fixed_val_timestep: 300
-  max_val_samples: null
-
-output:
-  output_dir: /home/yhmi/data/experiments/flux_finetune
-  save_freq: 1
-  save_freq_iters: 5000  
+  fixed_val_timestep: 500
+  sample_num: 500

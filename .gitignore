@@ -1,4 +1,4 @@
-# Python
+# ========== Python 基础 ==========
 **/__pycache__/
 *.py[cod]
 *$py.class
@@ -20,43 +20,38 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
+# ========== Virtual environments ==========
 venv/
 env/
 ENV/
 .venv
 
-# Jupyter Notebook
+# ========== Jupyter ==========
 .ipynb_checkpoints/
 *.ipynb
+.jupyterlab/
 
-# PyCharm
+# ========== IDE ==========
 .idea/
-
-# VSCode
 .vscode/
 
-# Jupyter Lab
-.jupyterlab/
-labworkspace/
-shared/
-
-# Logs
+# ========== 日志和实验输出 ==========
 logs/
 *.log
 tb_logger/
 swanlog/
-
-# Experiments output
 experiments/
 outputs/
 checkpoints/
 flux1-schnell/
+
+# ========== 模型和权重文件 ==========
 *.pth
 *.pt
 *.ckpt
+*.safetensors
 
-# Temporary files
+# ========== 临时文件 ==========
 *.swp
 *.swo
 *~
@@ -64,15 +59,36 @@ flux1-schnell/
 Thumbs.db
 *.tmp
 
-# Third-party libraries
+# ========== 第三方依赖库 ==========
 basicsr/
 
-# Process scripts (not needed in repo)
+# ========== 处理脚本（临时脚本） ==========
 resize.py
 resize_foundir.py
 process.py
 load.py
 filter.py
+extract_text_embedding.py
+select_timestep.py
+test_checkpoint.py
+mon.py
+utils.py
 
-# Train flux1 empty folder
+# ========== 训练脚本（需要时可重新创建） ==========
+train_restore_condition.py
+train_restore.py
+
+# ========== 空的占位目录 ==========
+vis/*
+data/*
 src/train_flux1/
+
+# ========== diffusers 本地修改（使用 patch 或重新修改） ==========
+# diffusers/src/
+
+# ========== 缓存文件 ==========
+tensorboard/
+wandb/
+*.h5
+*.npy
+*.npz

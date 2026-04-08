@@ -20,6 +20,7 @@ from diffusers import (
     FluxImg2ImgPipeline,
     FluxTransformer2DModel,
 )
+from diffusers.models.normalization import AdaLayerNormZero
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import (
     compute_density_for_timestep_sampling,
@@ -60,7 +61,7 @@ class ConditionTrainer:
 
         set_seed(self.config.seed)
 
-        self.num_classes: int = self.config.network.get("num_classes", 5)
+        self.num_classes: int = self.config.network.get("num_classes", 4)
         self.current_epoch: int = 0
         self.global_step: int = 0
 
@@ -81,9 +82,11 @@ class ConditionTrainer:
         self.train_datasets: List[Any] = []
         self.val_datasets: List[Any] = []
         self.prompt_embed_cache: Dict[int, Tuple[Any, Any, Any]] = {}
+        self._fixed_vis_samples: Optional[List[Dict[str, Any]]] = None
 
         self.deg_classifier = DegNet_DINO(
-            dino_type=self.config.network.get("dino_type", None)
+            dino_type=self.config.network.get("dino_type", None),
+            num_types=self.num_classes
         )
         self.deg_classifier.load_state_dict(
             torch.load(self.config.network.degradation_classifier_path, map_location="cpu"),
@@ -180,6 +183,8 @@ class ConditionTrainer:
         nn.init.orthogonal_(self.transformer.class_embedding_U)
         self._class_embedding_U_cpu = self.transformer.class_embedding_U.data.clone().cpu()
 
+        self._unfreeze_adaln_layers()
+
         self.noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model_path,
             subfolder="scheduler",
@@ -194,13 +199,39 @@ class ConditionTrainer:
         if self.config.accelerator.get("allow_tf32", False):
             torch.backends.cuda.matmul.allow_tf32 = True
 
+    def _unfreeze_adaln_layers(self) -> None:
+        """
+        解冻 AdaLN 中 SiLU 之后的 Linear 层（shift/scale/gate 投影）
+
+        AdaLayerNormZero: Linear(dim, 6*dim) -> 输出 shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+        """
+        unfreeze_type = self.config.network.get("unfreeze_adaln_type", "adaln")
+
+        if unfreeze_type == "single":
+            return
+
+        adaln_linear_count = 0
+        for name, module in self.transformer.named_modules():
+            if isinstance(module, AdaLayerNormZero):
+                module.linear.requires_grad_(True)
+                adaln_linear_count += 1
+
+        self.logger.info(f"[AdaLN] unfreeze AdaLayerNormZero: {adaln_linear_count} layers")
+
+    def _get_param_name(self, param: nn.Parameter) -> str:
+        for name, p in self.transformer.named_parameters():
+            if p is param:
+                return name
+        return ""
+
     def extract_deg_feat(self, lq_images: torch.Tensor) -> torch.Tensor:
         self.deg_classifier.to(self.accelerator.device)
         self.deg_classifier.eval()
 
         with torch.no_grad():
             logits = self.deg_classifier(lq_images)
-            probs = F.softmax(logits[:, :, 0], dim=-1)
+            # 逐行softmax
+            probs = F.softmax(logits, dim=-1)[:, :, 0]
 
         probs = probs.detach().clone().to(dtype=self.weight_dtype)
         class_emb_U = self._class_embedding_U_full
@@ -226,6 +257,7 @@ class ConditionTrainer:
                 resolution=resolution,
                 prompt=prompt,
                 dataset_idx=ds_idx,
+                enlarge_ratio=ds_cfg.get("enlarge_ratio", 1.0),
             )
             if is_val:
                 val_datasets.append(dataset)
@@ -310,6 +342,14 @@ class ConditionTrainer:
         all_trainable = {p for p in self.transformer.parameters() if p.requires_grad}
         assert trainable_params_set == all_trainable, (
             f"Parameter mismatch: trainable={len(all_trainable)}, grouped={len(trainable_params_set)}"
+        )
+
+        adaln_params = [p for p in no_decay_params if ".linear." in self._get_param_name(p)]
+        mlp_params = [p for p in no_decay_params if ".linear." not in self._get_param_name(p)]
+        self.logger.info(
+            f"[Training parameters] class_embedding_U: {len(decay_params)} parameters, "
+            f"AdaLN Linear: {len(adaln_params)} parameters, "
+            f"MLP (not frozen): {len(mlp_params)} parameters"
         )
 
         wd = opt_cfg.get("weight_decay", 0.01)
@@ -450,7 +490,7 @@ class ConditionTrainer:
                     timesteps, n_dim=lq_latents.ndim, dtype=lq_latents.dtype
                 )
 
-            noisy_input = (1.0 - sigmas) * lq_latents + sigmas * noise
+            noisy_input = (1.0 - sigmas) * hq_latents + sigmas * noise
 
             packed_input = FluxImg2ImgPipeline._pack_latents(
                 noisy_input,
@@ -583,7 +623,24 @@ class ConditionTrainer:
 
         to_tensor = transforms.ToTensor()
 
+        num_vis_samples = self.config.val.get("num_vis_samples", 4)
+
+        # Use fixed vis samples if already cached
+        use_cached_vis = self._fixed_vis_samples is not None and len(self._fixed_vis_samples) > 0
+        vis_batch_indices = None
+        if use_cached_vis:
+            vis_batch_indices = {cand["batch_idx"] for cand in self._fixed_vis_samples}
+
+        if self.is_main:
+            vis_dir = os.path.join(self.output_dir, f"val_vis_iter_{self.global_step}")
+            os.makedirs(vis_dir, exist_ok=True)
+
         max_val_samples = self.config.val.get("max_val_samples")
+
+        # Track vis candidates from different datasets (for first-time caching)
+        vis_candidates: List[Dict[str, Any]] = []
+        seen_datasets = set()
+
         for batch_idx, batch in enumerate(self.val_dataloader):
             if max_val_samples and batch_idx >= max_val_samples:
                 break
@@ -592,16 +649,28 @@ class ConditionTrainer:
             cond_pixel_values = batch["conditioning_pixel_values"].to(
                 self.accelerator.device
             )
+            dataset_idx = int(batch["dataset_indices"][0].item())
+
+            # Collect vis sample from first occurrence of each dataset
+            if not use_cached_vis and dataset_idx not in seen_datasets and len(vis_candidates) < num_vis_samples:
+                seen_datasets.add(dataset_idx)
+                vis_candidates.append({"batch_idx": batch_idx, "batch": batch})
 
             cond_img_pil = transforms.ToPILImage()(cond_pixel_values[0].cpu()).convert("RGB")
+            lq_latents = encode_images(cond_pixel_values, self.vae, self.weight_dtype)
 
-            cond_latents = encode_images(
-                cond_pixel_values, self.vae, self.weight_dtype
+            noise = torch.randn_like(lq_latents)
+            timesteps = torch.full(
+                (1,),
+                fixed_val_timestep,
+                device=lq_latents.device,
+                dtype=self.weight_dtype,
+            )
+            sigmas = self._get_sigmas(
+                timesteps, n_dim=lq_latents.ndim, dtype=lq_latents.dtype
             )
 
-            timestep_tensor = torch.tensor(
-                [fixed_val_timestep], device=self.accelerator.device, dtype=self.weight_dtype
-            )
+            noisy_input = (1.0 - sigmas) * lq_latents + sigmas * noise
 
             prompt_embeds, pooled_prompt_embeds, text_ids = self._get_prompt_embeds_from_cache(
                 batch["dataset_indices"]
@@ -609,18 +678,18 @@ class ConditionTrainer:
 
             latent_image_ids = FluxImg2ImgPipeline._prepare_latent_image_ids(
                 1,
-                cond_latents.shape[2] // 2,
-                cond_latents.shape[3] // 2,
+                lq_latents.shape[2] // 2,
+                lq_latents.shape[3] // 2,
                 self.accelerator.device,
                 self.weight_dtype,
             )
 
             packed_input = FluxImg2ImgPipeline._pack_latents(
-                cond_latents,
+                noisy_input,
                 batch_size=1,
-                num_channels_latents=cond_latents.shape[1],
-                height=cond_latents.shape[2],
-                width=cond_latents.shape[3],
+                num_channels_latents=noisy_input.shape[1],
+                height=noisy_input.shape[2],
+                width=noisy_input.shape[3],
             )
 
             if self.unwrap_fn(self.transformer).config.guidance_embeds:
@@ -638,7 +707,7 @@ class ConditionTrainer:
 
             model_pred = self.unwrap_fn(self.transformer)(
                 hidden_states=packed_input,
-                timestep=timestep_tensor / 1000,
+                timestep=timesteps.float() / 1000,
                 guidance=guidance,
                 pooled_projections=pooled_prompt_embeds,
                 encoder_hidden_states=prompt_embeds,
@@ -647,15 +716,18 @@ class ConditionTrainer:
                 return_dict=False,
             )[0]
 
-            model_pred = FluxImg2ImgPipeline._unpack_latents(
-                model_pred,
-                height=cond_latents.shape[2] * self.vae_scale_factor,
-                width=cond_latents.shape[3] * self.vae_scale_factor,
+            # Reconstruct: x_pred = x_t - sigma * model_pred
+            x_pred = noisy_input - sigmas * model_pred
+
+            model_pred_unpacked = FluxImg2ImgPipeline._unpack_latents(
+                x_pred,
+                height=lq_latents.shape[2] * self.vae_scale_factor,
+                width=lq_latents.shape[3] * self.vae_scale_factor,
                 vae_scale_factor=self.vae_scale_factor,
             )
 
-            model_pred = model_pred / self.vae.config.scaling_factor + self.vae.config.shift_factor
-            generated = self.vae.decode(model_pred.to(dtype=torch.float32)).sample
+            model_pred_unpacked = model_pred_unpacked / self.vae.config.scaling_factor + self.vae.config.shift_factor
+            generated = self.vae.decode(model_pred_unpacked.to(dtype=torch.float32)).sample
             generated = (generated / 2 + 0.5).clamp(0, 1)
             generated = generated.cpu().float().permute(0, 2, 3, 1).numpy()[0]
             generated = (generated * 255).astype(np.uint8)
@@ -672,14 +744,55 @@ class ConditionTrainer:
             all_ssim.append(ssim_val)
             all_psnr.append(psnr_val)
 
-            if batch_idx < 4:
+            # Save visualization images - use fixed samples from different datasets
+            is_vis_sample = False
+            if use_cached_vis:
+                is_vis_sample = any(
+                    cand["batch_idx"] == batch_idx for cand in self._fixed_vis_samples
+                )
+            else:
+                is_vis_sample = any(
+                    cand["batch_idx"] == batch_idx for cand in vis_candidates
+                )
+
+            if self.is_main and is_vis_sample:
+                # Determine sample index for naming
+                if use_cached_vis:
+                    sample_idx = next(
+                        i for i, cand in enumerate(self._fixed_vis_samples)
+                        if cand["batch_idx"] == batch_idx
+                    )
+                else:
+                    sample_idx = next(
+                        i for i, cand in enumerate(vis_candidates)
+                        if cand["batch_idx"] == batch_idx
+                    )
+
+                # Get GT image
+                gt_img = (pixel_values[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                gt_img = Image.fromarray(gt_img).convert("RGB")
+
+                # Save LQ, pred, HQ as separate images
+                lq_path = os.path.join(vis_dir, f"sample_{sample_idx:03d}_LQ.png")
+                pred_path = os.path.join(vis_dir, f"sample_{sample_idx:03d}_pred.png")
+                hq_path = os.path.join(vis_dir, f"sample_{sample_idx:03d}_HQ.png")
+
+                cond_img_pil.save(lq_path)
+                generated.save(pred_path)
+                gt_img.save(hq_path)
+
                 image_logs.append(
                     {
                         "validation_image": cond_img_pil,
                         "images": [generated],
                         "validation_prompt": self.val_datasets[0].prompt if self.val_datasets else "",
+                        "dataset_idx": dataset_idx,
                     }
                 )
+
+        # Cache fixed vis samples after first validation
+        if self._fixed_vis_samples is None and len(vis_candidates) > 0:
+            self._fixed_vis_samples = vis_candidates
 
         avg_ssim = sum(all_ssim) / len(all_ssim) if all_ssim else None
         avg_psnr = sum(all_psnr) / len(all_psnr) if all_psnr else None
@@ -741,48 +854,63 @@ class ConditionTrainer:
         self.transformer.train()
 
         num_epochs = self.config.train.num_train_epochs
+        steps_per_epoch = len(self.train_dataloader)
+        total_steps = num_epochs * steps_per_epoch
+
+        val_freq_iters = self.config.val.get("val_freq_iters", 1000)
+        save_freq_iters = self.config.train.get("save_freq_iters", 5000)
+
+        if self.is_main:
+            pbar = tqdm(
+                total=total_steps,
+                disable=not self.is_main,
+                desc="Training",
+            )
 
         for epoch in range(num_epochs):
             self.current_epoch = epoch + 1
-            pbar = tqdm(
-                self.train_dataloader,
-                disable=not self.is_main,
-                desc=f"Epoch {self.current_epoch}",
-            )
 
-            for batch in pbar:
+            for batch in self.train_dataloader:
                 loss = self.training_step(batch)
 
                 if self.is_main:
                     pbar.set_postfix(
                         {
+                            "iter": self.global_step,
                             "loss": f"{loss.item():.4f}",
                             "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                         }
                     )
+                    pbar.update(1)
 
-            val_cfg = self.config.val
-            if (
-                self.val_dataloader is not None
-                and (epoch + 1) % val_cfg.get("val_freq", 1) == 0
-            ):
-                self.transformer.eval()
-                image_logs = self.validation()
-                self.transformer.train()
+                # Validation based on iter frequency
+                if (
+                    self.val_dataloader is not None
+                    and self.global_step % val_freq_iters == 0
+                    and self.global_step > 0
+                ):
+                    self.transformer.eval()
+                    image_logs = self.validation()
+                    self.transformer.train()
 
-                if self.is_main and image_logs:
-                    print("\n" + "=" * 60)
-                    print(f"Epoch {self.current_epoch} Validation")
-                    print("=" * 60)
-                    if image_logs.get("ssim") is not None:
-                        print(f"SSIM: {image_logs['ssim']:.4f} | PSNR: {image_logs['psnr']:.2f}")
-                    print("=" * 60)
+                    if self.is_main and image_logs:
+                        print("\n" + "=" * 60)
+                        print(f"Validation @ iter {self.global_step}")
+                        print("=" * 60)
+                        if image_logs.get("ssim") is not None:
+                            print(f"SSIM: {image_logs['ssim']:.4f} | PSNR: {image_logs['psnr']:.2f}")
+                        print("=" * 60)
 
-            save_freq = self.config.train.get("save_freq", 1)
-            if self.is_main and (epoch + 1) % save_freq == 0:
-                self.save_ckpt()
+                # Save checkpoint based on iter frequency
+                if (
+                    self.is_main
+                    and self.global_step % save_freq_iters == 0
+                    and self.global_step > 0
+                ):
+                    self.save_ckpt()
 
         if self.is_main:
+            pbar.close()
             self.save_ckpt(is_best=True)
 
         self.accelerator.end_training()
