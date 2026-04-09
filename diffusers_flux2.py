@@ -1,8 +1,10 @@
 import argparse
+import copy
 import logging
 import math
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import cv2
@@ -23,6 +25,7 @@ from diffusers import (
     FlowMatchEulerDiscreteScheduler,
     Flux2KleinPipeline,
 )
+from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinIRPipeline
 from diffusers.models.transformers import Flux2Transformer2DModel
 from diffusers.models.transformers.transformer_flux2 import Flux2Modulation
 from diffusers.optimization import get_scheduler
@@ -35,22 +38,25 @@ from src.networks.degnet import DegNet_DINO
 from torch.utils.data import ConcatDataset
 from tqdm.auto import tqdm
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
+from accelerate import DistributedDataParallelKwargs
 
 check_min_version("0.38.0.dev0")
 logger = logging.getLogger(__name__)
 
 def log_once(msg, accelerator=None):
     if accelerator is None or accelerator.is_main_process:
-        logger.info(msg)
+        print(msg, flush=True)
+        sys.stdout.flush()
+
 _lpips_model = None
 
-def _get_lpips_model(device="cuda"):
+def get_lpips_model(device="cuda"):
     global _lpips_model
     if _lpips_model is None:
         _lpips_model = lpips.LPIPS(net="alex").eval().to(device)
     return _lpips_model
 
-def _compute_metrics_np(pred_np: np.ndarray, gt_np: np.ndarray, lpips_model=None) -> dict:
+def compute_metrics(pred_np: np.ndarray, gt_np: np.ndarray, lpips_model=None) -> dict:
     pred_t = torch.from_numpy(pred_np).permute(2, 0, 1).float() / 255.0  # [3, H, W], [0,1]
     gt_t = torch.from_numpy(gt_np).permute(2, 0, 1).float() / 255.0
 
@@ -62,13 +68,13 @@ def _compute_metrics_np(pred_np: np.ndarray, gt_np: np.ndarray, lpips_model=None
                          reduction="mean").item()
 
     # LPIPS: lpips expects inputs in [-1, 1], shape [B, 3, H, W]
-    lpips_t = lpips_model if lpips_model is not None else _get_lpips_model()
-    pred_lpips = pred_t * 2.0 - 1.0
-    gt_lpips = gt_t * 2.0 - 1.0
+    lpips_t = lpips_model if lpips_model is not None else get_lpips_model()
+    lpips_device = next(lpips_t.parameters()).device
+    pred_lpips = pred_t.to(lpips_device) * 2.0 - 1.0
+    gt_lpips = gt_t.to(lpips_device) * 2.0 - 1.0
     lpips_val = lpips_t(pred_lpips.unsqueeze(0), gt_lpips.unsqueeze(0)).item()
 
     return {"ssim": ssim_val, "psnr": psnr_val, "lpips": lpips_val}
-
 
 class FLUX2ModulationV2(nn.Module):
     def __init__(
@@ -102,7 +108,7 @@ class FLUX2ModulationV2(nn.Module):
         self.up_conv = nn.ConvTranspose2d(768, 768, kernel_size=4, stride=2, padding=1)
         self.feat_proj = nn.Linear(768, dim * 3 * mod_param_sets)
 
-    def fourier_encode(self, block_idx: int | torch.Tensor) -> torch.Tensor:
+    def fourier_encode(self, block_idx: int | torch.Tensor, target_dtype: torch.dtype = None) -> torch.Tensor:
         if isinstance(block_idx, torch.Tensor):
             block_idx = (
                 block_idx.item() if block_idx.numel() == 1 else block_idx.float()
@@ -116,7 +122,12 @@ class FLUX2ModulationV2(nn.Module):
             self.num_freqs, device=block_idx.device, dtype=block_idx.dtype
         )
         angs = freqs * math.pi * block_idx.unsqueeze(-1)
-        return torch.cat([torch.sin(angs), torch.cos(angs)], dim=-1)
+        result = torch.cat([torch.sin(angs), torch.cos(angs)], dim=-1)
+        
+        # Cast to target_dtype if provided
+        if target_dtype is not None:
+            result = result.to(target_dtype)
+        return result
 
     def forward(
         self,
@@ -130,16 +141,27 @@ class FLUX2ModulationV2(nn.Module):
         mod = self.act_fn(temb)
         mod = self.linear(mod)
 
+        # Cast lq_tensor to temb.dtype to avoid dtype mismatch with convnext and subsequent layers
+        lq_tensor_dtype = temb.dtype
+        if lq_tensor.dtype != lq_tensor_dtype:
+            lq_tensor = lq_tensor.to(lq_tensor_dtype)
+        
         feat = self.convnext.features(lq_tensor)  # [B,768,H//32,W//32]
         feat = self.up_conv(feat)  # [B,768,H//16,W//16]
         feat = feat.flatten(2).permute(0, 2, 1).view(-1, 768)  # [B*H*W//256,768]
         feat = self.feat_proj(feat)  # [B*H*W//256,dim * 3 * mod_param_sets]
+        
+        # Ensure feat is in temb.dtype for subsequent operations
+        if feat.dtype != temb.dtype:
+            feat = feat.to(temb.dtype)
+            
         feat = feat.view(
             B, 3 * self.mod_param_sets, -1, self.dim
         )  # [B, 3 * mod_param_sets, H*W//256, dim] -> [B, 3 * mod_param_sets, seq_len ,dim]
 
         if block_idx is not None:
-            block_emb = self.block_proj(self.fourier_encode(block_idx))
+            # Use temb's dtype for block embedding to avoid dtype mismatch
+            block_emb = self.block_proj(self.fourier_encode(block_idx, target_dtype=temb.dtype))
             mod = mod + block_emb  # [B, dim * 3 * mod_param_sets]
 
         mod = mod.view(
@@ -150,147 +172,139 @@ class FLUX2ModulationV2(nn.Module):
         return mod
 
     @staticmethod
-    def split(
-        mod: torch.Tensor, mod_param_sets: int
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
+    def split(mod: torch.Tensor, mod_param_sets: int) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
         if mod.ndim == 2:
             mod = mod.unsqueeze(1)
-        mod_params = torch.chunk(mod, 3 * mod_param_sets, dim=1)
-        return tuple(mod_params[3 * i : 3 * (i + 1)] for i in range(mod_param_sets))
+            mod_params = torch.chunk(mod, 3 * mod_param_sets, dim=-1)
+            return tuple(mod_params[3 * i : 3 * (i + 1)] for i in range(mod_param_sets))
+        elif mod.ndim == 4:
+            # [B,3*mod_param_sets,seq,dim]
+            mod.params = torch.chunk(mod, 3 * mod_param_sets, dim=1)
+            return tuple(mod_params[3 * i : 3 * (i + 1)] for i in range(mod_param_sets))
 
 def log_validation(
-    pipeline,
+    unwrapped_transformer,
+    vae,
+    weight_dtype,
     args,
     accelerator,
     pipeline_args,
     epoch,
-    torch_dtype,
+    global_step=0,
     is_final_validation=False,
-    deg_extractor=None,
-    text_ids=None,
-    cond_pixel_values=None,
-    noise_scheduler=None,
-    val_dataset=None,
 ):
-    log_once(
-        f"Running validation at epoch {epoch} (global_step {accelerator.global_step})...",
-        accelerator,
-    )
-    pipeline = pipeline.to(dtype=torch_dtype)
-    pipeline.enable_model_cpu_offload()
-    pipeline.set_progress_bar_config(disable=True)
+    unwrapped_transformer.eval()
 
-    generator = (
-        torch.Generator(device=accelerator.device).manual_seed(args.seed)
-        if args.seed is not None
-        else None
-    )
+    def get_sigmas_fixed(sigmas_tensor, n_dim, dtype):
+        sigmas_tensor = sigmas_tensor.float()
+        schedule = sigmas_tensor
+        while True:
+            schedule = schedule[:-1]
+            if len(schedule) <= n_dim:
+                break
+        return schedule.float().to(dtype=dtype)
 
-    # Same sigma/timestep logic as training
-    if noise_scheduler is not None and args.fixed_timestep is not None:
-        fixed_idx = args.fixed_timestep
-        sigma = torch.tensor(
-            [noise_scheduler.sigmas[fixed_idx].item()],
-            device=accelerator.device,
-            dtype=torch_dtype,
-        )
-        t_scheduler = noise_scheduler.timesteps[fixed_idx].item()
-        timestep = torch.tensor(
-            [t_scheduler / 1000.0],
-            device=accelerator.device,
-            dtype=torch_dtype,
-        )
-    else:
-        sigma = None
-        timestep = None
+    def gather_list(lst):
+        if accelerator.num_processes == 1:
+            return lst
+        gathered = [None] * accelerator.num_processes
+        torch.distributed.all_gather_object(gathered, lst)
+        out = []
+        for g in gathered:
+            out.extend(g)
+        return out
 
-    # Iterate over all validation images in the dataset
-    num_val_samples = len(val_dataset) if val_dataset is not None else args.num_validation_images
-    log_once(f"Validation: running inference on {num_val_samples} images...", accelerator)
-
-    metric_ssim, metric_psnr, metric_lpips = [], [], []
-    lpips_model = _get_lpips_model(accelerator.device) if val_dataset is not None else None
-    images_to_log = []
-
-    for sample_idx in range(num_val_samples):
-        if val_dataset is not None and sample_idx < len(val_dataset):
-            sample = val_dataset[sample_idx]
-            lq_tensor = sample["cond_pixel_values"]      # [3, H, W], [-1, 1]
-            gt_tensor = sample["pixel_values"]           # [3, H, W], [-1, 1]
-
-            # Convert LQ tensor → PIL Image for pipeline
-            lq_np = (
-                ((lq_tensor.numpy().transpose(1, 2, 0) + 1.0) * 127.5)
-                .clip(0, 255)
-                .astype(np.uint8)
-            )
-            sample_image = Image.fromarray(lq_np)
-            sample_pipeline_args = {
-                "image": sample_image,
-                "prompt_embeds": pipeline_args["prompt_embeds"],
-                "text_ids": text_ids,
-            }
-            cond_on_lq = lq_tensor.to(accelerator.device, dtype=torch_dtype)
-        else:
-            # Fallback: reuse the pre-built pipeline_args (only valid for sample_idx == 0)
-            sample_pipeline_args = pipeline_args
-            gt_tensor = None
-            cond_on_lq = cond_pixel_values
-
-        if deg_extractor is not None and cond_on_lq is not None:
-            deg_token = deg_extractor(cond_on_lq.unsqueeze(0).to(accelerator.device, dtype=torch_dtype)).unsqueeze(1)
-            guidance_single = torch.full(
-                [1], args.guidance_scale, device=accelerator.device, dtype=torch_dtype
-            )
-            pred_output = pipeline.single_step_inference(
-                image=sample_pipeline_args["image"],
-                prompt_embeds=sample_pipeline_args["prompt_embeds"],
-                text_ids=sample_pipeline_args["text_ids"],
-                guidance=guidance_single,
-                deg_token=deg_token,
-                timestep=timestep,
-                sigma=sigma,
-                generator=generator,
-                output_type="pil",
-                return_dict=True,
-            )
-            pred_image = pred_output.images[0]
-        else:
-            pred_image = pipeline(
-                image=sample_pipeline_args["image"],
-                prompt_embeds=sample_pipeline_args["prompt_embeds"],
-                generator=generator,
-            ).images[0]
-
-        # Compute metrics if GT is available
-        if val_dataset is not None and gt_tensor is not None:
-            pred_np = np.asarray(pred_image)
-            gt_np = (
-                ((gt_tensor.numpy().transpose(1, 2, 0) + 1.0) * 127.5)
-                .clip(0, 255)
-                .astype(np.uint8)
-            )
-            # Resize GT to match prediction if shape differs
-            if gt_np.shape != pred_np.shape:
-                gt_np = cv2.resize(gt_np, (pred_np.shape[1], pred_np.shape[0]),
-                                   interpolation=cv2.INTER_LINEAR)
-            metrics = _compute_metrics_np(pred_np, gt_np, lpips_model=lpips_model)
-            metric_ssim.append(metrics["ssim"])
-            metric_psnr.append(metrics["psnr"])
-            metric_lpips.append(metrics["lpips"])
-
-        # Log up to num_validation_images sample images
-        if sample_idx < args.num_validation_images:
-            images_to_log.append(pred_image)
-
-    images = images_to_log
-
-    # Log metrics
+    is_main = accelerator.is_main_process
     phase = "test" if is_final_validation else "validation"
-    if val_dataset is not None and metric_ssim:
-        avg_ssim = float(np.mean(metric_ssim))
-        avg_psnr = float(np.mean(metric_psnr))
-        avg_lpips = float(np.mean(metric_lpips))
+
+    local_ssim, local_psnr, local_lpips = [], [], []
+    local_images = []
+
+    num_vis = min(args.num_validation_images, 4)
+    desc = f"[GPU{accelerator.process_index}] Val"
+    pbar = tqdm(pipeline_args, desc=desc, disable=not is_main, file=sys.stdout, leave=True)
+
+    guidance_scale = args.guidance_scale
+    fixed_timestep = args.fixed_timestep
+
+    for val_idx, batch in enumerate(pbar):
+        lq_pixels = batch["lq_pixel_values"].to(accelerator.device)
+        hq_pixels = batch["hq_pixel_values"].to(accelerator.device)
+        batch_size = lq_pixels.shape[0]
+
+        lq_latents = vae.encode(lq_pixels.to(vae.dtype)).latent_dist.sample().to(weight_dtype)
+        bs, c, h, w = lq_latents.shape
+
+        packed = lq_latents.view(bs, c, h, 2, w, 2).permute(0, 2, 4, 1, 3, 5).reshape(bs, h * w, c * 4)
+        img_ids = torch.cartesian_prod(
+            torch.arange(1, device=packed.device),
+            torch.arange(h // 2, device=packed.device),
+            torch.arange(w // 2, device=packed.device),
+            torch.arange(1, device=packed.device),
+        ).unsqueeze(0).expand(bs, -1, -1).contiguous()
+
+        timesteps = torch.full((batch_size,), fixed_timestep, device=packed.device, dtype=weight_dtype)
+        sigmas = get_sigmas_fixed(timesteps, lq_latents.ndim, weight_dtype)
+
+        noise = torch.randn_like(packed)
+        noisy_input = (1.0 - sigmas) * packed + sigmas * noise
+
+        guidance = torch.full((batch_size,), guidance_scale, device=packed.device, dtype=weight_dtype)
+
+        deg_emb = None
+        if hasattr(args, "num_deg_types"):
+            deg_emb = unwrapped_transformer.extract_deg_feat(lq_pixels, num_deg_types=args.num_deg_types)
+            deg_emb = deg_emb.unsqueeze(1)
+
+        prompt_embeds = batch["prompt_embeds"].to(packed.device) if "prompt_embeds" in batch else None
+        txt_ids = torch.zeros((batch_size, 1, 3), device=packed.device, dtype=torch.long)
+        if prompt_embeds is None:
+            prompt_embeds = torch.zeros((batch_size, 512, 4096), device=packed.device, dtype=weight_dtype)
+
+        with torch.no_grad():
+            model_pred = unwrapped_transformer(
+                hidden_states=noisy_input,
+                timestep=timesteps.float() / 1000,
+                guidance=guidance,
+                encoder_hidden_states=prompt_embeds,
+                txt_ids=txt_ids,
+                img_ids=img_ids,
+                deg_emb=deg_emb,
+                return_dict=False,
+            )[0]
+
+        model_pred_unpacked = model_pred.view(bs, h, w, c, 2, 2).permute(0, 3, 1, 4, 2, 5).reshape(bs, c, h * 2, w * 2)
+        x_pred = packed - sigmas.view(bs, 1, 1, 1) * model_pred_unpacked
+
+        if hasattr(vae.config, "shift_factor") and vae.config.shift_factor is not None:
+            x_pred = x_pred / vae.config.scaling_factor + vae.config.shift_factor
+
+        recon = vae.decode(x_pred.to(dtype=torch.float32)).sample
+        pred_t = (recon / 2 + 0.5).clamp(0, 1)
+        gt_t = (hq_pixels + 1.0) / 2.0
+
+        lpips_model = get_lpips_model(accelerator.device)
+        pred_np = (pred_t[0].permute(1, 2, 0).float().cpu().numpy() * 255).astype(np.uint8)
+        gt_np = (gt_t[0].permute(1, 2, 0).float().cpu().numpy() * 255).astype(np.uint8)
+
+        metrics = compute_metrics(pred_np, gt_np, lpips_model=lpips_model)
+        local_ssim.append(metrics["ssim"])
+        local_psnr.append(metrics["psnr"])
+        local_lpips.append(metrics["lpips"])
+        local_images.append(Image.fromarray(pred_np))
+
+        if val_idx >= num_vis - 1:
+            break
+
+    all_ssim = gather_list(local_ssim)
+    all_psnr = gather_list(local_psnr)
+    all_lpips = gather_list(local_lpips)
+
+    avg_ssim = float(np.mean(all_ssim)) if all_ssim else 0.0
+    avg_psnr = float(np.mean(all_psnr)) if all_psnr else 0.0
+    avg_lpips = float(np.mean(all_lpips)) if all_lpips else 0.0
+
+    if is_main:
         log_once(
             f"[{phase}] Epoch {epoch} — SSIM: {avg_ssim:.4f}  PSNR: {avg_psnr:.2f}  LPIPS: {avg_lpips:.4f}",
             accelerator,
@@ -300,26 +314,18 @@ def log_validation(
             tracker.writer.add_scalar(f"{phase}/psnr", avg_psnr, epoch)
             tracker.writer.add_scalar(f"{phase}/lpips", avg_lpips, epoch)
 
-    # Log images
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images(phase, np_images, epoch, dataformats="NHWC")
-        elif tracker.name == "swanlab":
-            tracker.log(
-                {
-                    phase: [
-                        swanlab.Image(image, caption=f"{i}")
-                        for i, image in enumerate(images)
-                    ]
-                },
-                step=accelerator.global_step,
-            )
+        images = local_images[:args.num_validation_images]
+        for tracker in accelerator.trackers:
+            if tracker.name == "tensorboard":
+                np_images = np.stack([np.asarray(img) for img in images])
+                tracker.writer.add_images(phase, np_images, epoch, dataformats="NHWC")
+            elif tracker.name == "swanlab":
+                tracker.log(
+                    {phase: [swanlab.Image(img, caption=f"{i}") for i, img in enumerate(images)]},
+                    step=accelerator.global_step,
+                )
 
-    del pipeline
-    free_memory()
-    return images
-
+    torch.distributed.barrier()
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(
@@ -422,7 +428,13 @@ def parse_args(input_args=None):
         "--fixed_timestep",
         type=int,
         default=300,
-        help="Fixed timestep index for single-step image restoration.",
+        help="Fixed timestep index for noise injection (determines sigma_start).",
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=1,
+        help="Number of denoising steps in pipeline inference.",
     )
     parser.add_argument(
         "--dataloader_num_workers",
@@ -529,16 +541,16 @@ def parse_args(input_args=None):
 
 
 def collate_fn(examples):
-    pixel_values = torch.stack([e["pixel_values"] for e in examples]).float()
-    cond_pixel_values = torch.stack([e["cond_pixel_values"] for e in examples]).float()
+    hq_pixel_values = torch.stack([e["hq_pixel_values"] for e in examples]).float()
+    lq_pixel_values = torch.stack([e["lq_pixel_values"] for e in examples]).float()
     prompts = [e["instance_prompt"] for e in examples]
     dataset_indices = torch.tensor(
         [e["dataset_idx"] for e in examples], dtype=torch.long
     )
 
     return {
-        "pixel_values": pixel_values,
-        "cond_pixel_values": cond_pixel_values,
+        "hq_pixel_values": hq_pixel_values,
+        "lq_pixel_values": lq_pixel_values,
         "prompts": prompts,
         "dataset_indices": dataset_indices,
     }
@@ -583,7 +595,7 @@ class DegFeatExtractor:
         with torch.no_grad():
             logits = self.deg_classifier(lq_images)
             probs = F.softmax(logits, dim=-1)[:, :, 0]
-        deg_feat = probs.to(dtype=self.weight_dtype) @ self._class_embedding_U
+        deg_feat = probs.to(dtype=self.weight_dtype) @ self._class_embedding_U.to(probs.device)
         return deg_feat
 
 
@@ -592,11 +604,13 @@ def main(args):
     accelerator_project_config = ProjectConfiguration(
         project_dir=args.output_dir, logging_dir=logging_dir
     )
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
+        kwargs_handlers=[ddp_kwargs],
     )
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -831,37 +845,24 @@ def main(args):
             embeds, tids = compute_text_embeddings(prompt_str, text_encoding_pipeline)
         dataset_prompt_embeds_cache[ds_idx] = embeds
         dataset_text_ids_cache[ds_idx] = tids
-        log_once(
-            f"Precomputed prompt embeddings for dataset {ds_idx}: '{prompt_str}'",
-            accelerator,
-        )
 
-    val_kwargs_list = None
+    val_dataloaders_list = None
     if val_datasets and val_prompts:
-        val_kwargs_list = []
+        val_dataloaders_list = []
         for ds, val_prompt in zip(val_datasets, val_prompts):
-            sample = ds[0]
-            cond_tensor = sample["cond_pixel_values"]
-            cond_np = (
-                ((cond_tensor.numpy().transpose(1, 2, 0) + 1.0) * 127.5)
-                .clip(0, 255)
-                .astype(np.uint8)
+            sampler = torch.utils.data.DistributedSampler(
+                ds,
+                num_replicas=accelerator.num_processes,
+                rank=accelerator.process_index,
+                shuffle=False,
             )
-            val_image = Image.fromarray(cond_np)
-            prompt_embeds, text_ids_val = compute_text_embeddings(
-                val_prompt, text_encoding_pipeline
+            val_loader = torch.utils.data.DataLoader(
+                ds,
+                batch_size=1,
+                num_workers=args.dataloader_num_workers,
+                sampler=sampler,
             )
-            val_kwargs = {
-                "image": val_image,
-                "prompt_embeds": prompt_embeds,
-                "text_ids": text_ids_val,
-                "cond_pixel_values": cond_tensor,
-            }
-            val_kwargs_list.append((val_prompt, val_kwargs, ds))
-        log_once(
-            f"Prepared {len(val_kwargs_list)} validation sets from YAML",
-            accelerator,
-        )
+            val_dataloaders_list.append((val_prompt, val_loader))
 
     del text_encoder, tokenizer, text_encoding_pipeline
     free_memory()
@@ -1065,10 +1066,13 @@ def main(args):
                     model_input = vae.encode(lq_pixel_values).latent_dist.mode()
                     hq_latent = vae.encode(hq_pixel_values).latent_dist.mode()
 
-                model_input = Flux2KleinPipeline._patchify_latents(model_input)
+                model_input = Flux2KleinIRPipeline._patchify_latents(model_input)
                 model_input = (model_input - latents_bn_mean) / latents_bn_std
 
-                model_input_ids = Flux2KleinPipeline._prepare_latent_ids(model_input).to(
+                hq_target =  Flux2KleinIRPipeline._patchify_latents(hq_latent)
+                hq_target = (hq_target - latents_bn_mean) / latents_bn_std
+
+                model_input_ids = Flux2KleinIRPipeline._prepare_latent_ids(model_input).to(
                     device=model_input.device
                 )
 
@@ -1076,6 +1080,7 @@ def main(args):
                 bsz = model_input.shape[0]
 
                 if args.fixed_timestep is not None:
+                    # 300 < 1000
                     fixed_idx = min(
                         args.fixed_timestep, len(noise_scheduler.timesteps) - 1
                     )
@@ -1095,7 +1100,7 @@ def main(args):
                 )
                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
 
-                packed_noisy_model_input = Flux2KleinPipeline._pack_latents(
+                packed_noisy_model_input = Flux2KleinIRPipeline._pack_latents(
                     noisy_model_input
                 )
 
@@ -1113,10 +1118,18 @@ def main(args):
                 )
 
                 deg_token = deg_extractor(lq_pixel_values).unsqueeze(1)
-
+                #print(f"\n========== Training Loop - Transformer Input ==========")
+                #print(f"[TRAIN] packed_noisy_model_input: {packed_noisy_model_input.shape}")
+                #print(f"[TRAIN] timesteps: {timesteps.shape}, values: {timesteps[:5]}")
+                #print(f"[TRAIN] guidance: {guidance.shape}")
+                #print(f"[TRAIN] prompt_embeds: {prompt_embeds.shape}")
                 deg_txt_id = text_ids[:, :1, :].clone()
                 deg_txt_ids = torch.cat([deg_txt_id, text_ids], dim=1)
-
+                #print(f"[TRAIN] deg_txt_ids: {deg_txt_ids.shape}")
+                #print(f"[TRAIN] model_input_ids: {model_input_ids.shape}")
+                #print(f"[TRAIN] deg_token: {deg_token.shape}")
+                #print(f"[TRAIN] lq_pixel_values: {lq_pixel_values.shape}")
+                
                 model_pred = transformer(
                     hidden_states=packed_noisy_model_input,
                     timestep=timesteps / 1000,
@@ -1133,7 +1146,7 @@ def main(args):
                 model_input_ids_trimmed = model_input_ids[
                     :, : orig_input_ids_shape[1], :
                 ]
-                model_pred = Flux2KleinPipeline._unpack_latents_with_ids(
+                model_pred = Flux2KleinIRPipeline._unpack_latents_with_ids(
                     model_pred, model_input_ids_trimmed
                 )
 
@@ -1141,7 +1154,7 @@ def main(args):
                     weighting_scheme="none", sigmas=sigmas
                 )
                 # lq_latent  -> hq_latent
-                target = noise - hq_latent
+                target = noise - hq_target
                 loss = torch.mean(
                     (
                         weighting.float() * (model_pred.float() - target.float()) ** 2
@@ -1203,36 +1216,26 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
-        if accelerator.is_main_process:
-            if val_kwargs_list is not None and epoch % args.validation_epochs == 0:
-                unwrapped_transformer = accelerator.unwrap_model(transformer)
-                pipeline = Flux2KleinPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    text_encoder=None,
-                    tokenizer=None,
-                    transformer=unwrapped_transformer,
-                    variant=args.variant,
-                    torch_dtype=weight_dtype,
-                )
-                for val_idx, (vp, val_kwargs, val_ds) in enumerate(val_kwargs_list):
-                    log_once(f"[Val {val_idx}] Running validation...", accelerator)
-                    log_validation(
-                        pipeline=pipeline,
-                        args=args,
-                        accelerator=accelerator,
-                        pipeline_args=val_kwargs,
-                        epoch=epoch,
-                        torch_dtype=weight_dtype,
-                        deg_extractor=deg_extractor,
-                        text_ids=val_kwargs["text_ids"],
-                        cond_pixel_values=val_kwargs["cond_pixel_values"],
-                        noise_scheduler=noise_scheduler,
-                        val_dataset=val_ds,
-                    )
-                del pipeline
-                free_memory()
+        accelerator.wait_for_everyone()
 
-    accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            pass  # validation disabled
+            # if val_dataloaders_list is not None and epoch % args.validation_epochs == 0:
+            #     unwrapped_transformer = accelerator.unwrap_model(transformer)
+            #     for val_idx, (_, val_loader) in enumerate(val_dataloaders_list):
+            #         log_validation(
+            #             unwrapped_transformer=unwrapped_transformer,
+            #             vae=vae,
+            #             weight_dtype=weight_dtype,
+            #             args=args,
+            #             accelerator=accelerator,
+            #             pipeline_args=val_loader,
+            #             epoch=epoch,
+            #             global_step=global_step,
+            #             is_final_validation=False,
+            #         )
+
+        accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
         unwrapped_transformer = accelerator.unwrap_model(transformer)
@@ -1255,40 +1258,23 @@ def main(args):
             accelerator,
         )
 
-        # Final validation with saved weights
-        if val_kwargs_list is not None and args.num_validation_images > 0:
-            pipeline = Flux2KleinPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                variant=args.variant,
-                torch_dtype=weight_dtype,
-            )
-            mod_state_dict = torch.load(
-                os.path.join(args.output_dir, "modulation_weights.pt"),
-                map_location="cpu",
-            )
-            pipeline.transformer.load_state_dict(mod_state_dict, strict=False)
-            log_once("Loaded modulation weights for final validation", accelerator)
+        # Final validation
+        # if val_dataloaders_list is not None and args.num_validation_images > 0:
+        #     unwrapped_transformer = accelerator.unwrap_model(transformer)
+        #     for val_idx, (_, val_loader) in enumerate(val_dataloaders_list):
+        #         log_validation(
+        #             unwrapped_transformer=unwrapped_transformer,
+        #             vae=vae,
+        #             weight_dtype=weight_dtype,
+        #             args=args,
+        #             accelerator=accelerator,
+        #             pipeline_args=val_loader,
+        #             epoch=-1,
+        #             global_step=global_step,
+        #             is_final_validation=True,
+        #         )
 
-            for val_idx, (vp, val_kwargs, val_ds) in enumerate(val_kwargs_list):
-                log_once(f"[Final Val {val_idx}] Running final validation...", accelerator)
-                log_validation(
-                    pipeline=pipeline,
-                    args=args,
-                    accelerator=accelerator,
-                    pipeline_args=val_kwargs,
-                    epoch=-1,
-                    torch_dtype=weight_dtype,
-                    is_final_validation=True,
-                    deg_extractor=deg_extractor,
-                    text_ids=val_kwargs["text_ids"],
-                    cond_pixel_values=val_kwargs["cond_pixel_values"],
-                    noise_scheduler=noise_scheduler,
-                    val_dataset=val_ds,
-                )
-            del pipeline
-            free_memory()
-
-    accelerator.end_training()
+        accelerator.end_training()
 
 if __name__ == "__main__":
     args = parse_args()

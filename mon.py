@@ -16,11 +16,21 @@ last_alert = 0
 
 while True:
     out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=index,utilization.gpu", "--format=csv,noheader,nounits"],
+        ["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader,nounits"],
         capture_output=True, text=True
     ).stdout.strip()
 
-    idle = [l for l in out.split("\n") if l and int(l.split(",")[1].strip()) < args.threshold]
+    idle = []
+    for line in out.split("\n"):
+        if not line:
+            continue
+        parts = line.split(",")
+        used = int(parts[1].strip())
+        total = int(parts[2].strip())
+        usage_pct = used / total * 100
+        if usage_pct < args.threshold:
+            idle.append(usage_pct)
+
     free = len(idle)
 
     ts = time.strftime("%H:%M:%S")
