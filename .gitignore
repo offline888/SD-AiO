@@ -62,22 +62,6 @@ Thumbs.db
 # ========== 第三方依赖库 ==========
 basicsr/
 
-# ========== 处理脚本（临时脚本） ==========
-resize.py
-resize_foundir.py
-process.py
-load.py
-filter.py
-extract_text_embedding.py
-select_timestep.py
-test_checkpoint.py
-mon.py
-utils.py
-
-# ========== 训练脚本（需要时可重新创建） ==========
-train_restore_condition.py
-train_restore.py
-
 # ========== 空的占位目录 ==========
 vis/*
 data/*
