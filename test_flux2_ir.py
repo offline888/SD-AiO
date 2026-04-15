@@ -1,6 +1,9 @@
 import argparse
 import os
 import sys
+import glob
+import yaml
+import re
 
 import torch
 from diffusers import Flux2KleinIRPipeline
@@ -12,6 +15,7 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 for _p in [_script_dir, os.path.dirname(_script_dir)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(
@@ -28,6 +32,14 @@ def parse_args(input_args=None):
         default="data/output/flux2_lora/checkpoint-50000/modulation_weights.pt",
     )
     parser.add_argument("--lq_image", type=str, default=None)
+    parser.add_argument(
+        "--data_yaml",
+        type=str,
+        default=None,
+        help="Path to YAML config file (e.g. options/train/data.yaml). "
+        "Inference will be run on all images under the lq_path of each ValDataset entry, "
+        "saved under output_dir/<deg_type>/<image_name>.",
+    )
     parser.add_argument(
         "--prompt", type=str, default="A cat holding a sign that says hello world"
     )
@@ -78,14 +90,23 @@ def build_inference_pipeline(
         pretrained_model_path, torch_dtype=dtype
     )
 
+    # Move to dtype first (before CPU offload wraps modules with meta tensors)
+    pipe.vae = pipe.vae.to(dtype=dtype)
+    pipe.transformer = pipe.transformer.to(dtype=dtype)
+
+    # Force all parameters to CPU before sequential offload to avoid mixed device issues
+    pipe.transformer = pipe.transformer.to(device="cpu", dtype=dtype)
+
     if getattr(args, "disable_cpu_offload", False):
         pipe.to(device)
+        pipe.transformer = pipe.transformer.to(device=device, dtype=dtype)
+        pipe.vae = pipe.vae.to(device=device, dtype=dtype)
+        if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
+            pipe.text_encoder = pipe.text_encoder.to(device=device, dtype=dtype)
     else:
         pipe.enable_sequential_cpu_offload()
 
     pipe.eval()
-
-    pipe.vae = pipe.vae.to(dtype)
 
     _replace_modulation(pipe.transformer, device, dtype)
 
@@ -94,19 +115,29 @@ def build_inference_pipeline(
         state_dict = torch.load(
             modulation_weights_path, map_location="cpu", weights_only=True
         )
-        transf_dict = {
-            k.replace("transformer.", ""): v
-            for k, v in state_dict.items()
-            if "transformer." in k
-        }
-        pipe.transformer.load_state_dict(transf_dict, strict=False)
-        print(f"[INFO] Loaded {len(transf_dict)} modulation tensors into transformer")
 
+        # Load modulation weights into transformer
+        loaded_mod_count = 0
         for k, v in state_dict.items():
-            if "class_embedding_U" in k:
+            if k.startswith("double_stream_") or k.startswith("single_"):
+                # Key format in checkpoint: "double_stream_modulation_img.linear.weight"
+                # Key format in transformer: "double_stream_modulation_img.linear.weight"
+                pipe.transformer.state_dict()[k].copy_(v)
+                loaded_mod_count += 1
+            elif "class_embedding_U" in k:
                 class_emb = v
                 print(f"[INFO] Loaded class_embedding_U: shape={class_emb.shape}")
-                break
+
+        print(f"[INFO] Loaded {loaded_mod_count} modulation tensors into transformer")
+
+    # Print double_stream_modulation_img structure
+    mod_img = pipe.transformer.double_stream_modulation_img
+    print(f"\n[INFO] double_stream_modulation_img structure:")
+    print(f"  Type: {type(mod_img).__name__}")
+    print(f"  dim: {mod_img.dim}, mod_param_sets: {mod_img.mod_param_sets}, n_blocks: {getattr(mod_img, 'n_blocks', 'N/A')}")
+    for name, param in sorted(mod_img.named_parameters(), key=lambda x: x[0]):
+        print(f"  {name}: {param.shape}")
+    print()
 
     pipe.deg_extractor = DegFeatExtractor(
         transformer=pipe.transformer,
@@ -139,6 +170,91 @@ def _replace_modulation(transformer: Flux2Transformer2DModel, device, dtype):
     print(f"[INFO] Replaced modulation with FLUX2ModulationV2 (n_blocks={n_blocks})")
 
 
+def _nat_sort_key(s: str) -> list:
+    """Natural sort key so that file_10.png comes after file_2.png, not file_1."""
+    return [int(c) if c.isdigit() else c for c in re.split(r"(\d+)", s)]
+
+
+def _infer_single(
+    pipe: Flux2KleinIRPipeline,
+    lq_image: Image.Image,
+    prompt: str,
+    args: argparse.Namespace,
+    generator: torch.Generator | None,
+) -> Image.Image:
+    output = pipe(
+        lq_image=lq_image,
+        prompt=prompt,
+        num_inference_steps=args.num_inference_steps,
+        guidance_scale=args.guidance_scale,
+        fixed_timestep=args.fixed_timestep,
+        generator=generator,
+    )
+    return output.images[0]
+
+
+def _run_yaml_inference(pipe: Flux2KleinIRPipeline, yaml_path: str, args: argparse.Namespace):
+    """Read data.yaml and run inference on all ValDataset entries."""
+    with open(yaml_path, "r") as f:
+        yaml_cfg = yaml.safe_load(f)
+
+    # Collect ValDataset entries in definition order (sorted by key)
+    val_keys = sorted(
+        [k for k in yaml_cfg if k.startswith("ValDataset")],
+        key=lambda k: int(re.search(r"\d+", k).group()),
+    )
+    if not val_keys:
+        print("[WARN] No ValDataset entries found in YAML.")
+        return
+
+    total_images = 0
+    for ds_key in val_keys:
+        ds = yaml_cfg[ds_key]
+        lq_path: str = ds.get("lq_path", "")
+        prompt: str = ds.get("prompt", args.prompt)
+        deg_type: str = ds.get("deg_type", os.path.basename(os.path.normpath(lq_path)))
+
+        if not os.path.isdir(lq_path):
+            print(f"[WARN] Skipping {ds_key}: lq_path '{lq_path}' is not a directory.")
+            continue
+
+        # Collect image files, natural-sorted
+        exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"}
+        img_files = sorted(
+            [f for f in os.listdir(lq_path) if os.path.splitext(f.lower())[1] in exts],
+            key=_nat_sort_key,
+        )
+        if not img_files:
+            print(f"[WARN] No images found in {lq_path}.")
+            continue
+
+        ds_output_dir = os.path.join(args.output_dir, deg_type)
+        os.makedirs(ds_output_dir, exist_ok=True)
+
+        print(f"\n[{ds_key}] deg_type={deg_type}, lq_path={lq_path}, {len(img_files)} images")
+        for i, fname in enumerate(img_files):
+            lq_full_path = os.path.join(lq_path, fname)
+            lq_image = Image.open(lq_full_path).convert("RGB")
+            if args.resize_to is not None:
+                lq_image = lq_image.resize((args.resize_to, args.resize_to))
+
+            # Seed per image using global seed + offset to keep reproducibility
+            seed = args.seed + i if args.seed else None
+            generator = (
+                torch.Generator(device=args.device).manual_seed(seed)
+                if seed
+                else None
+            )
+
+            result = _infer_single(pipe, lq_image, prompt, args, generator)
+            out_path = os.path.join(ds_output_dir, fname)
+            result.save(out_path)
+            total_images += 1
+            print(f"  [{i+1}/{len(img_files)}] {fname} -> {out_path}")
+
+    print(f"\n[INFO] YAML inference complete. Total images processed: {total_images}")
+
+
 def main(args):
     dtype_map = {
         "float32": torch.float32,
@@ -160,30 +276,36 @@ def main(args):
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.lq_image:
+    if args.data_yaml:
+        _run_yaml_inference(pipe, args.data_yaml, args)
+    elif args.lq_image:
         lq_image = Image.open(args.lq_image).convert("RGB")
         if args.resize_to is not None:
             lq_image = lq_image.resize((args.resize_to, args.resize_to))
+
+        generator = (
+            torch.Generator(device=args.device).manual_seed(args.seed)
+            if args.seed
+            else None
+        )
+        output = _infer_single(pipe, lq_image, args.prompt, args, generator)
+
+        out_path = os.path.join(args.output_dir, "output.png")
+        output.save(out_path)
+        print(f"[INFO] Saved to {out_path}")
     else:
+        # Default grey placeholder
         lq_image = Image.new("RGB", (512, 512), color=(128, 128, 128))
+        generator = (
+            torch.Generator(device=args.device).manual_seed(args.seed)
+            if args.seed
+            else None
+        )
+        output = _infer_single(pipe, lq_image, args.prompt, args, generator)
 
-    generator = (
-        torch.Generator(device=args.device).manual_seed(args.seed)
-        if args.seed
-        else None
-    )
-    output = pipe(
-        lq_image=lq_image,
-        prompt=args.prompt,
-        num_inference_steps=args.num_inference_steps,
-        guidance_scale=args.guidance_scale,
-        fixed_timestep=args.fixed_timestep,
-        generator=generator,
-    )
-
-    out_path = os.path.join(args.output_dir, "output.png")
-    output.images[0].save(out_path)
-    print(f"[INFO] Saved to {out_path}")
+        out_path = os.path.join(args.output_dir, "output.png")
+        output.save(out_path)
+        print(f"[INFO] Saved to {out_path}")
 
 
 if __name__ == "__main__":

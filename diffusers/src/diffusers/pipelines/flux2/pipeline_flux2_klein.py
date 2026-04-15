@@ -205,6 +205,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self.tokenizer_max_length = 512
         self.default_sample_size = 128
 
+    def eval(self):
+        for component in self.components.values():
+            if isinstance(component, torch.nn.Module):
+                component.eval()
+        return self
+
     @staticmethod
     def _get_qwen3_prompt_embeds(
         text_encoder: Qwen3ForCausalLM,
@@ -901,13 +907,18 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         # Pass pre-computed latent height/width to avoid DtoH sync from torch.max().item()
         latent_height = 2 * (int(height) // (self.vae_scale_factor * 2))
         latent_width = 2 * (int(width) // (self.vae_scale_factor * 2))
-        latents = self._unpack_latents_with_ids(latents, latent_ids, latent_height // 2, latent_width // 2)
 
-        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
+        # BN denormalize BEFORE _unpack_latents_with_ids (symmetric with encode path where
+        # BN normalize was applied before _pack_latents). The packed latents are in the
+        # patchified space (C=64), so we use the BN stats from the original VAE latent
+        # space (C=16) — they naturally tile across the 4 patchified channels.
+        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1).to(latents.device, latents.dtype)
+        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1) + self.vae.config.batch_norm_eps).to(
             latents.device, latents.dtype
         )
         latents = latents * latents_bn_std + latents_bn_mean
+
+        latents = self._unpack_latents_with_ids(latents, latent_ids, latent_height // 2, latent_width // 2)
         latents = self._unpatchify_latents(latents)
         if output_type == "latent":
             image = latents

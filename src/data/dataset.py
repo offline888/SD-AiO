@@ -6,17 +6,18 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
-import torchvision.transforms as transforms
+import torchvision.transforms as T
+
 
 class PairedDataset(Dataset):
     def __init__(
         self,
         lq_path: str,
         hq_path: str,
-        resolution: int = 512,  
+        resolution: int = 512,
         prompt: str = "",
         dataset_idx: int = 0,
-        transforms: Callable = None,
+        custom_transforms: Callable = None,
         enlarge_ratio: float = 1.0,
         deg_type: str = None,
     ):
@@ -27,15 +28,13 @@ class PairedDataset(Dataset):
         self.enlarge_ratio = enlarge_ratio
         self.deg_type = deg_type if deg_type is not None else None
 
-        if transforms is not None:
-            self.transforms = transforms
+        if custom_transforms is not None:
+            self.transforms = custom_transforms
         else:
-            self.transforms = transforms.Compose([
-                transforms.Resize((resolution, resolution)),  
-                # PIL [0,255] → Tensor [0,1]
-                transforms.ToTensor(),
-                # [0,1] → [-1,1]
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  
+            self.transforms = T.Compose([
+                T.Resize((resolution, resolution)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
 
         self.lq_dir = os.path.abspath(lq_path)

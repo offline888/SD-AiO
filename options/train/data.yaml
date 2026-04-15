@@ -2,26 +2,36 @@ TrainDataset1:
   lq_path: /home/yhmi/data/patches/10Rain/LQ_train
   hq_path: /home/yhmi/data/patches/10Rain/GT
   prompt: "remove rain from this image"
+  deg_type: "rain"
+  enlarge_ratio: 1
 
 TrainDataset2:
   lq_path: /home/yhmi/data/patches/08Haze/LQ_train
   hq_path: /home/yhmi/data/patches/08Haze/GT
   prompt: "remove haze from this image"
+  deg_type: "haze"
+  enlarge_ratio: 1
 
 TrainDataset3:
   lq_path: /home/yhmi/data/patches/14Lowlight/LQ_train
   hq_path: /home/yhmi/data/patches/14Lowlight/GT
   prompt: "enhance low light in this image"
+  deg_type: "lowlight"
+  enlarge_ratio: 1
 
 TrainDataset4:
   lq_path: /home/yhmi/data/patches/09Lowlight_Haze/LQ_train
   hq_path: /home/yhmi/data/patches/09Lowlight_Haze/GT
   prompt: "enhance low light and remove haze from this image"
+  deg_type: "lowlight_haze"
+  enlarge_ratio: 1
 
 TrainDataset5:
   lq_path: /home/yhmi/data/patches/13Rain_Haze/LQ_train
   hq_path: /home/yhmi/data/patches/13Rain_Haze/GT
   prompt: "remove rain and haze from this image"
+  deg_type: "rain_haze"
+  enlarge_ratio: 1
 
 ValDataset1:
   lq_path: /home/yhmi/data/patches/10Rain/LQ_val

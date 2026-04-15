@@ -339,34 +339,21 @@ class Flux2AttnProcessor:
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        #print(f"\n========== Flux2AttnProcessor.__call__ ==========")
-        #print(f"[DEBUG] hidden_states: {hidden_states.shape}")
-        #print(f"[DEBUG] encoder_hidden_states: {encoder_hidden_states.shape if encoder_hidden_states is not None else None}")
-        #print(f"[DEBUG] attn.added_kv_proj_dim: {attn.added_kv_proj_dim}")
-        #print(f"[DEBUG] attn.heads: {attn.heads}, attn.head_dim: {attn.head_dim}, attn.inner_dim: {attn.inner_dim}")
-        
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
         )
-        #print(f"[DEBUG] after projections:")
-        #print(f"         query: {query.shape}, key: {key.shape}, value: {value.shape}")
-        #print(f"         encoder_query: {encoder_query.shape if hasattr(encoder_query, 'shape') else encoder_query}")
 
         query = query.unflatten(-1, (attn.heads, -1))
         key = key.unflatten(-1, (attn.heads, -1))
         value = value.unflatten(-1, (attn.heads, -1))
-        #print(f"[DEBUG] after unflatten: query: {query.shape}")
 
         query = attn.norm_q(query)
         key = attn.norm_k(key)
 
         if attn.added_kv_proj_dim is not None:
-            #print(f"[DEBUG] processing encoder_* projections")
-            #print(f"[DEBUG] encoder_query before unflatten: {encoder_query.shape if hasattr(encoder_query, 'shape') else encoder_query}")
             encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
             encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
             encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
-            #print(f"[DEBUG] after encoder unflatten: encoder_query: {encoder_query.shape}")
 
             encoder_query = attn.norm_added_q(encoder_query)
             encoder_key = attn.norm_added_k(encoder_key)
@@ -920,25 +907,15 @@ class Flux2TransformerBlock(nn.Module):
         (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = Flux2Modulation.split(temb_mod_img, 2)
         (c_shift_msa, c_scale_msa, c_gate_msa), (c_shift_mlp, c_scale_mlp, c_gate_mlp) = Flux2Modulation.split(temb_mod_txt, 2)
 
-        #print(f"[DEBUG] shift_msa={shift_msa.shape}, scale_msa={scale_msa.shape}, gate_msa={gate_msa.shape}")
-        #print(f"[DEBUG] c_shift_msa={c_shift_msa.shape}, c_scale_msa={c_scale_msa.shape}, c_gate_msa={c_gate_msa.shape}")
-        #print(f"[DEBUG BLOCK] hidden_states={hidden_states.shape}, encoder_hidden_states={encoder_hidden_states.shape}")
-        
         # Img stream
         norm_hidden_states = self.norm1(hidden_states)
-        #print(f"[DEBUG] norm_hidden_states={norm_hidden_states.shape}")
         norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
 
         # Conditioning txt stream
         norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
-        #print(f"[DEBUG] norm_encoder_hidden_states={norm_encoder_hidden_states.shape}")
         norm_encoder_hidden_states = (1 + c_scale_msa) * norm_encoder_hidden_states + c_shift_msa
 
         # Attention on concatenated img + txt stream
-        #print(f"[DEBUG] calling self.attn:")
-        #print(f"         hidden_states: {norm_hidden_states.shape}")
-        #print(f"         encoder_hidden_states: {norm_encoder_hidden_states.shape}")
-        
         attention_outputs = self.attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
@@ -947,7 +924,6 @@ class Flux2TransformerBlock(nn.Module):
         )
 
         attn_output, context_attn_output = attention_outputs
-        #print(f"[DEBUG] attn output: attn_output={attn_output.shape}, context_attn_output={context_attn_output.shape}")
 
         # Process attention outputs for the image stream (`hidden_states`).
         attn_output = gate_msa * attn_output
@@ -1061,8 +1037,10 @@ class Flux2Modulation(nn.Module):
             mod_params = torch.chunk(mod, 3 * mod_param_sets, dim=-1)
         elif mod.ndim == 4:
             # [B, 6, seq, dim] -> chunk along dim=1 -> 6 x [B, 1, seq, dim]
-            mod = mod.reshape(mod.shape[0],-1,mod.shape[-1])
+            mod = mod.reshape(mod.shape[0], -1, mod.shape[-1])
             mod_params = torch.chunk(mod, 3 * mod_param_sets, dim=1)
+        else:
+            raise ValueError(f"Expected mod to have 2 or 4 dimensions, got {mod.ndim}")
         return tuple(mod_params[3 * i : 3 * (i + 1)] for i in range(mod_param_sets))
 
 class Flux2Transformer2DModel(
@@ -1255,18 +1233,7 @@ class Flux2Transformer2DModel(
             `tuple` where the first element is the sample tensor. When `kv_cache_mode="extract"`, also returns the
             populated `Flux2KVCache`.
         """
-        #print(f"\n========== Flux2Transformer2DModel.forward ==========")
-        #print(f"[INPUT] hidden_states: {hidden_states.shape}, dtype={hidden_states.dtype}")
-        #print(f"[INPUT] encoder_hidden_states: {encoder_hidden_states.shape}, dtype={encoder_hidden_states.dtype}")
-        #print(f"[INPUT] timestep: {timestep.shape if hasattr(timestep, 'shape') else timestep}")
-        #print(f"[INPUT] guidance: {guidance.shape if hasattr(guidance, 'shape') else guidance}")
-        #print(f"[INPUT] img_ids: {img_ids.shape if hasattr(img_ids, 'shape') else img_ids}")
-        #print(f"[INPUT] txt_ids: {txt_ids.shape if hasattr(txt_ids, 'shape') else txt_ids}")
-        #print(f"[INPUT] deg_emb: {deg_emb.shape if deg_emb is not None and hasattr(deg_emb, 'shape') else deg_emb}")
-        #print(f"[INPUT] lq_tensor: {lq_tensor.shape if lq_tensor is not None and hasattr(lq_tensor, 'shape') else lq_tensor}")
-        
         num_txt_tokens = encoder_hidden_states.shape[1]
-        #print(f"[DEBUG] num_txt_tokens (before cat): {num_txt_tokens}")
 
         # 1. Calculate timestep embedding and modulation parameters
         # IMPORTANT: Use model's dtype (bfloat16 for mixed precision) instead of hidden_states.dtype (float32 from VAE)
@@ -1277,7 +1244,6 @@ class Flux2Transformer2DModel(
             guidance = guidance.to(model_dtype) * 1000
 
         temb = self.time_guidance_embed(timestep, guidance)
-        #print(f"[DEBUG] temb after time_guidance_embed: {temb.shape}, dtype={temb.dtype}")
 
         # KV extract mode: pre-warm time embedder (in case future use)
         if kv_cache_mode == "extract" and num_ref_tokens > 0:
@@ -1289,23 +1255,20 @@ class Flux2Transformer2DModel(
         target_dtype = model_dtype
         if hidden_states.dtype != target_dtype:
             hidden_states = hidden_states.to(target_dtype)
-            #print(f"[DEBUG] cast hidden_states to {target_dtype}: {hidden_states.shape}")
         hidden_states = self.x_embedder(hidden_states)
-        #print(f"[DEBUG] hidden_states after x_embedder: {hidden_states.shape}, dtype={hidden_states.dtype}")
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
-        #print(f"[DEBUG] encoder_hidden_states after context_embedder: {encoder_hidden_states.shape}, dtype={encoder_hidden_states.dtype}")
-        #print(f"[DEBUG] deg_emb before cat: {deg_emb.shape if deg_emb is not None else None}")
         if deg_emb is not None and deg_emb.dtype != target_dtype:
             deg_emb = deg_emb.to(target_dtype)
-            #print(f"[DEBUG] cast deg_emb to {target_dtype}")
         encoder_hidden_states = torch.cat([deg_emb, encoder_hidden_states], dim=1)
-        #print(f"[DEBUG] encoder_hidden_states after cat with deg_emb: {encoder_hidden_states.shape}")
 
         # 3. Calculate RoPE embeddings from image and text tokens
+        # Handle squeeze: (B, 1, S, 4) -> (B, S, 4) -> (S, 4), or (B, S, 4) -> (S, 4)
+        if img_ids.ndim == 4:
+            img_ids = img_ids.squeeze(1)  # (B, 1, S, 4) -> (B, S, 4)
         if img_ids.ndim == 3:
-            img_ids = img_ids[0]
+            img_ids = img_ids[0]  # (B, S, 4) -> (S, 4)
         if txt_ids.ndim == 3:
-            txt_ids = txt_ids[0]
+            txt_ids = txt_ids[0]  # (B, S, 4) -> (S, 4)
 
         image_rotary_emb = self.pos_embed(img_ids)
         text_rotary_emb = self.pos_embed(txt_ids)
@@ -1334,17 +1297,12 @@ class Flux2Transformer2DModel(
 
         # 5. Double Stream Transformer Blocks
         for index_block, block in enumerate(self.transformer_blocks):
-            #print(f"\n========== Double Stream Block {index_block} ==========")
-            
             # Per-block modulation for img stream; txt stream is shared (no block awareness)
-            #print(f"[DEBUG] calling double_stream_modulation_img with temb: {temb.shape}")
             double_stream_mod_img = self.double_stream_modulation_img(lq_tensor=lq_tensor,
                                                                       temb=temb,
                                                                       block_idx=index_block)
-            #print(f"[DEBUG] double_stream_mod_img shape: {double_stream_mod_img.shape}")
-            
+
             double_stream_mod_txt = self.double_stream_modulation_txt(temb)
-            #print(f"[DEBUG] double_stream_mod_txt shape: {double_stream_mod_txt.shape}")
 
             if kv_cache_mode is not None and kv_cache is not None:
                 kv_attn_kwargs["kv_cache"] = kv_cache.get_double(index_block)

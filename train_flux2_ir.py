@@ -6,7 +6,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from diffusers.utils import (
+from diffusers.utils.logging import (
     get_logger,
     set_verbosity_info,
     set_verbosity_error,
@@ -14,6 +14,7 @@ from diffusers.utils import (
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.data
 import torchvision
 from accelerate import Accelerator, DistributedDataParallelKwargs
@@ -21,12 +22,11 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers import (
     AutoencoderKLFlux2,
     FlowMatchEulerDiscreteScheduler,
-    Flux2KleinPipeline,
+    Flux2KleinIRPipeline,
 )
 from diffusers.models.transformers import Flux2Transformer2DModel
 from diffusers.models.transformers.transformer_flux2 import Flux2Modulation
 from diffusers.optimization import get_scheduler
-from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinIRPipeline
 from diffusers.training_utils import compute_loss_weighting_for_sd3, free_memory
 from diffusers.utils import check_min_version
 from diffusers.utils.torch_utils import is_compiled_module
@@ -94,6 +94,11 @@ class FLUX2ModulationV2(nn.Module):
             weights=torchvision.models.ConvNeXt_Small_Weights.IMAGENET1K_V1,
         )
         self.up_conv = nn.ConvTranspose2d(768, 768, kernel_size=4, stride=2, padding=1)
+        #self.local_conv = nn.Sequential(
+        #    nn.Conv2d(768, 768, 3, padding=1, groups=768),  # depthwise: local neighborhood
+        #    nn.SiLU(),
+        #    nn.Conv2d(768, 768, 1),                         # pointwise: restore channels
+        #)
         self.feat_proj = nn.Linear(768, dim * 3 * mod_param_sets)
 
     def fourier_encode(
@@ -133,7 +138,8 @@ class FLUX2ModulationV2(nn.Module):
 
         feat = self.convnext.features(lq_tensor)  # [B,768,H//32,W//32]
         feat = self.up_conv(feat)  # [B,768,H//16,W//16]
-        feat = feat.flatten(2).permute(0, 2, 1).view(-1, self.dim)  # [B*H*W//256,768]
+        #feat = self.local_conv(feat)  # [B,768,H//16,W//16]
+        feat = feat.flatten(2).permute(0, 2, 1).view(-1, 768)  # [B*H*W//256,768]
         feat = self.feat_proj(feat)  # [B*H*W//256,dim * 3 * mod_param_sets]
 
         feat = feat.view(B, 3 * self.mod_param_sets, -1, self.dim).to(temb.dtype)
@@ -146,8 +152,8 @@ class FLUX2ModulationV2(nn.Module):
 
         mod = mod.view(
             B, 3 * self.mod_param_sets, 1, self.dim
-        )  # [B, 3 * mod_param_sets, dim]
-        mod = mod + feat  # [B, 3 * mod_param_sets, H*W//256, dim]
+        )  # [B, 3 * mod_param_sets, 1, dim]
+        mod = mod + feat  # [B, 3 * mod_param_sets, H//8*W//8, dim] — broadcast over spatial dim
 
         return mod
 
@@ -160,8 +166,7 @@ class FLUX2ModulationV2(nn.Module):
             mod_params = torch.chunk(mod, 3 * mod_param_sets, dim=-1)
             return tuple(mod_params[3 * i : 3 * (i + 1)] for i in range(mod_param_sets))
         elif mod.ndim == 4:
-            # [B,3*mod_param_sets,seq,dim]
-            mod.params = torch.chunk(mod, 3 * mod_param_sets, dim=1)
+            mod_params = torch.chunk(mod, 3 * mod_param_sets, dim=1)
             return tuple(mod_params[3 * i : 3 * (i + 1)] for i in range(mod_param_sets))
         else:
             raise RuntimeError(f"mod dim is not 2 or 4: {mod.ndim}")
@@ -382,7 +387,7 @@ def main(args):
         subfolder="text_encoder",
     )
 
-    text_encoding_pipeline = Flux2KleinPipeline.from_pretrained(
+    text_encoding_pipeline = Flux2KleinIRPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=None,
         transformer=None,
@@ -430,7 +435,7 @@ def main(args):
     for mod_name in modulation_names:
         if hasattr(transformer, mod_name):
             mod = getattr(transformer, mod_name)
-            for sub in ["convnext", "up_conv", "feat_proj", "block_proj"]:
+            for sub in ["convnext", "up_conv", "local_conv", "feat_proj", "block_proj"]:
                 if hasattr(mod, sub):
                     getattr(mod, sub).requires_grad_(True)
                     log_once(f"Unlocked {mod_name}.{sub}", accelerator)
@@ -742,6 +747,7 @@ def main(args):
                     model_input = vae.encode(lq_pixel_values).latent_dist.mode()
                     hq_latent = vae.encode(hq_pixel_values).latent_dist.mode()
 
+
                 model_input = Flux2KleinIRPipeline._patchify_latents(model_input)
                 model_input = (model_input - latents_bn_mean) / latents_bn_std
                 hq_target = Flux2KleinIRPipeline._patchify_latents(hq_latent)
@@ -776,8 +782,6 @@ def main(args):
                 orig_input_shape = packed_noisy_model_input.shape
                 orig_input_ids_shape = model_input_ids.shape
 
-                packed_noisy_model_input = packed_noisy_model_input.unsqueeze(1)
-                model_input_ids = model_input_ids.unsqueeze(1)
                 guidance = torch.full(
                     (bsz,),
                     args.guidance_scale,
