@@ -1025,23 +1025,30 @@ class Flux2Modulation(nn.Module):
         self.linear = nn.Linear(dim, dim * 3 * self.mod_param_sets, bias=bias)
         self.act_fn = nn.SiLU()
 
-    def forward(self, temb: torch.Tensor, block_id: torch.LongTensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        temb: torch.Tensor,
+        block_idx: torch.LongTensor | None = None,
+        lq_tensor: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
         mod = self.act_fn(temb)
         mod = self.linear(mod)
         return mod
 
     @staticmethod
-    def split(mod: torch.Tensor, mod_param_sets: int) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
+    def split(
+        mod: torch.Tensor, mod_param_sets: int
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
         if mod.ndim == 2:
             mod = mod.unsqueeze(1)
             mod_params = torch.chunk(mod, 3 * mod_param_sets, dim=-1)
-        elif mod.ndim == 4:
-            # [B, 6, seq, dim] -> chunk along dim=1 -> 6 x [B, 1, seq, dim]
-            mod = mod.reshape(mod.shape[0], -1, mod.shape[-1])
-            mod_params = torch.chunk(mod, 3 * mod_param_sets, dim=1)
+            return tuple(mod_params[3 * i : 3 * (i + 1)] for i in range(mod_param_sets))
+        elif mod.ndim == 3:
+            mod_params = torch.chunk(mod, 3 * mod_param_sets, dim=-1)
+            return tuple(mod_params[3 * i : 3 * (i + 1)] for i in range(mod_param_sets))
         else:
-            raise ValueError(f"Expected mod to have 2 or 4 dimensions, got {mod.ndim}")
-        return tuple(mod_params[3 * i : 3 * (i + 1)] for i in range(mod_param_sets))
+            raise RuntimeError(f"mod dim is not 2 or 3: {mod.ndim}")
 
 class Flux2Transformer2DModel(
     ModelMixin,

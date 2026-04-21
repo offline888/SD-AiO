@@ -113,7 +113,7 @@ network:
   encoder_layer_index: 12
 
 train:
-  num_epochs: 15
+  num_epochs: 30
   max_grad_norm: 1.0
   save_freq: 1
 

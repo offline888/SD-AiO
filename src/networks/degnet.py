@@ -248,7 +248,7 @@ class DegNet_DINO(nn.Module):
     def __init__(
         self,
         feature_dim: int = 512,
-        num_types: int = 6,
+        num_types: int = 4,
         dino_type: str = None,
         freeze_encoder: bool = False,
         patch_size: int = 14,

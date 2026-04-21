@@ -978,7 +978,6 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
         height: int | None = None,
         width: int | None = None,
         num_inference_steps: int = 1,
-        sigmas: list[float] | None = None,
         guidance_scale: float = 4.0,
         num_images_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
@@ -1010,8 +1009,6 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
                 The width in pixels of the generated image.
             num_inference_steps (`int`, *optional*, defaults to 1):
                 Number of denoising steps.
-            sigmas (`List[float]`, *optional*):
-                Custom sigmas for the denoising process.
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             generator (`torch.Generator`, *optional*):
@@ -1037,7 +1034,7 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
             text_encoder_out_layers (`tuple[int]`):
                 Layer indices to use in the text encoder.
             fixed_timestep (`int`, *optional*, defaults to 300):
-                Fixed timestep index for computing the initial noise level. 
+                Fixed timestep index for computing the initial noise level.
                 The value should be an integer in [0, 999].
 
         Returns:
@@ -1045,7 +1042,6 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
 
         Examples:
         """
-        # 1. Check inputs
         self.check_inputs(
             prompt=prompt,
             height=height,
@@ -1057,7 +1053,6 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
 
         self._guidance_scale = guidance_scale
         self._attention_kwargs = attention_kwargs
-        self._current_timestep = None
         self._interrupt = False
 
         # 2. Define call parameters
@@ -1070,7 +1065,7 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
 
         device = self._execution_device
 
-        # 3. Prepare text embeddings (conditional)
+        # 3. Encode prompt
         prompt_embeds, text_ids = self.encode_prompt(
             prompt=prompt,
             prompt_embeds=prompt_embeds,
@@ -1079,36 +1074,32 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
             max_sequence_length=max_sequence_length,
             text_encoder_out_layers=text_encoder_out_layers,
         )
-        # 4. Prepare text embeddings (unconditional for CFG)
-        do_cfg = self.do_classifier_free_guidance
-        negative_prompt_embeds = None
-        negative_text_ids = None
-        if do_cfg:
-            if self.text_encoder is not None:
-                negative_prompt = "" if prompt is None or isinstance(prompt, str) else ["" for _ in prompt]
-                negative_prompt_embeds, negative_text_ids = self.encode_prompt(
-                    prompt=negative_prompt,
-                    prompt_embeds=None,
-                    device=device,
-                    num_images_per_prompt=num_images_per_prompt,
-                    max_sequence_length=max_sequence_length,
-                    text_encoder_out_layers=text_encoder_out_layers,
-                )
-            else:
-                # text_encoder=None means prompt_embeds must be pre-computed (no CFG support)
-                do_cfg = False
 
-        # 5. Process LQ image: preprocess PIL images
+        do_cfg = self.do_classifier_free_guidance
+        if do_cfg and self.text_encoder is not None:
+            negative_prompt = "" if prompt is None or isinstance(prompt, str) else ["" for _ in prompt]
+            negative_prompt_embeds, negative_text_ids = self.encode_prompt(
+                prompt=negative_prompt,
+                prompt_embeds=None,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                text_encoder_out_layers=text_encoder_out_layers,
+            )
+        else:
+            do_cfg = False
+            negative_prompt_embeds = None
+            negative_text_ids = None
+
+        # 4. Preprocess LQ images
         if lq_image is not None and not isinstance(lq_image, list):
             lq_image = [lq_image]
 
         condition_images = None
-        lq_tensor_list = []
         if lq_image is not None:
-            for img in lq_image:
-                self.image_processor.check_image_input(img)
             condition_images = []
             for img in lq_image:
+                self.image_processor.check_image_input(img)
                 image_width, image_height = img.size
                 if image_width * image_height > 1024 * 1024:
                     img = self.image_processor._resize_to_target_area(img, 1024 * 1024)
@@ -1119,86 +1110,72 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
                 img = self.image_processor.preprocess(
                     img, height=image_height, width=image_width, resize_mode="crop"
                 )
-                condition_images.append(img)
-                img_t = img.to(device=device, dtype=self.vae.dtype)
-                lq_tensor_list.append(img_t)
+                condition_images.append(img.to(device=device, dtype=self.vae.dtype))
                 height = height or image_height
                 width = width or image_width
 
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
-        # 6. VAE encode each LQ image -> patchify -> BN-normalize
-        #    _encode_vae_image already does: encode → patchify → BN_norm
-        lq_latent_list = []
-        for img_t in lq_tensor_list:
-            latent = self._encode_vae_image(image=img_t, generator=generator)
-            lq_latent_list.append(latent)
+        # 5. Encode LQ images with VAE -> patchify -> BN-normalize
+        lq_latents = torch.cat(
+            [self._encode_vae_image(img, generator) for img in condition_images], dim=0
+        ) if condition_images else None
 
-        lq_latents = torch.cat(lq_latent_list, dim=0)
+        # 6. Pack LQ latents and prepare position IDs
+        if lq_latents is not None:
+            lq_latents_packed = self._pack_latents(lq_latents)
+            img_ids = self._prepare_latent_ids(lq_latents).to(device)
+        else:
+            lq_latents_packed = None
+            img_ids = None
 
-        # 7. Cat all lq_latents -> pack with _pack_latents + _prepare_latent_ids
-        lq_latents_packed = self._pack_latents(lq_latents)
-        img_ids = self._prepare_latent_ids(lq_latents).to(device)
-        # img_ids is [B, H*W, 4], reshape to [B, H*W, 4] (no channel-interleaving needed for position IDs)
-        packed_img_ids = img_ids.reshape(img_ids.shape[0], img_ids.shape[1], -1)
-
-        # Expand for num_images_per_prompt
+        # 7. Expand for num_images_per_prompt
         bsz = batch_size * num_images_per_prompt
-        lq_latents_packed = lq_latents_packed.repeat(num_images_per_prompt, 1, 1)
-        packed_img_ids = packed_img_ids.repeat(num_images_per_prompt, 1, 1)
+        if lq_latents_packed is not None:
+            lq_latents_packed = lq_latents_packed.repeat(num_images_per_prompt, 1, 1)
+            img_ids = img_ids.repeat(num_images_per_prompt, 1, 1)
 
-        dtype = lq_latents_packed.dtype
-
-        # 8. Compute sigma_start from fixed_timestep
+        # 8. Compute noise level and prepare noisy latents
         fixed_idx = min(fixed_timestep, len(self.scheduler.sigmas) - 1)
         sigma_start = self.scheduler.sigmas[fixed_idx].item()
-
-        # 9. Add noise ONCE: noisy_lq = (1 - sigma_start) * lq_latents_packed + sigma_start * noise
-        noise = torch.randn_like(lq_latents_packed)
+        noise = torch.randn_like(lq_latents_packed) if lq_latents_packed is not None else None
         current_latents = (1.0 - sigma_start) * lq_latents_packed + sigma_start * noise
 
-        # 10. deno_sigmas 序列：推理时只用这单个 sigma_start（单步 IR）
-        if sigmas is None:
-            deno_sigmas = np.array([sigma_start])
+        # 9. Prepare DEG token and text IDs
+        deg_emb = self.deg_extractor(torch.cat(condition_images, dim=0)).unsqueeze(1) if self.deg_extractor and condition_images else None
+        deg_txt_id = text_ids[:, :1, :].clone()
+        text_ids_with_deg = torch.cat([deg_txt_id, text_ids], dim=1)
+        if negative_text_ids is not None:
+            neg_deg_txt_id = negative_text_ids[:, :1, :].clone()
+            neg_text_ids_with_deg = torch.cat([neg_deg_txt_id, negative_text_ids], dim=1)
         else:
-            deno_sigmas = np.array(sigmas)
+            neg_text_ids_with_deg = None
 
-        # 11. Set scheduler timesteps with these sigmas
+        # 10. Set scheduler timesteps
+        deno_sigmas = np.array([sigma_start])
         self.scheduler.set_timesteps(
             num_inference_steps=num_inference_steps,
+            device=device,
             sigmas=deno_sigmas,
             mu=compute_empirical_mu(image_seq_len=lq_latents_packed.shape[1], num_steps=num_inference_steps),
         )
-        # 保存原始（shift 前）的 sigma 序列，供去噪循环直接逆推 x_0 使用
         self._raw_sigmas = torch.from_numpy(deno_sigmas).to(dtype=torch.float32, device=device)
         timesteps = self.scheduler.timesteps
         self.scheduler.set_begin_index(0)
-
         self._num_timesteps = len(timesteps)
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
-        # Prepare DEG token and text IDs
-        lq_tensors_concat = torch.cat(lq_tensor_list, dim=0) if lq_tensor_list else None
-        deg_emb = None
-        if self.deg_extractor is not None and lq_tensors_concat is not None:
-            deg_emb = self.deg_extractor(lq_tensors_concat).unsqueeze(1)
+        cfg_guidance = torch.full((bsz,), guidance_scale, device=device, dtype=current_latents.dtype)
 
-        deg_txt_id = text_ids[:, :1, :].clone()
-        text_ids_with_deg = torch.cat([deg_txt_id, text_ids], dim=1)
-
-        cfg_guidance = torch.full((bsz,), guidance_scale, device=device, dtype=dtype)
-
-        # 12. Iterate over timesteps, calling transformer for each step
+        # 11. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
 
                 self._current_timestep = t
-                timestep = t.expand(bsz).to(dtype)
+                timestep = t.expand(bsz).to(current_latents.dtype)
 
-                # Transformer forward: CONDITIONAL
                 with self.transformer.cache_context("cond"):
                     model_pred = self.transformer(
                         hidden_states=current_latents,
@@ -1206,17 +1183,13 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
                         guidance=cfg_guidance,
                         encoder_hidden_states=prompt_embeds,
                         txt_ids=text_ids_with_deg,
-                        img_ids=packed_img_ids,
+                        img_ids=img_ids,
                         deg_emb=deg_emb,
-                        lq_tensor=lq_tensors_concat,
+                        lq_tensor=torch.cat(condition_images, dim=0) if condition_images else None,
                         return_dict=False,
                     )[0]
 
-                # 13. Apply CFG: cond + guidance_scale * (cond - uncond)
                 if do_cfg:
-                    neg_deg_txt_id = negative_text_ids[:, :1, :].clone()
-                    neg_text_ids_with_deg = torch.cat([neg_deg_txt_id, negative_text_ids], dim=1)
-
                     with self.transformer.cache_context("uncond"):
                         neg_model_pred = self.transformer(
                             hidden_states=current_latents,
@@ -1224,27 +1197,21 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
                             guidance=None,
                             encoder_hidden_states=negative_prompt_embeds,
                             txt_ids=neg_text_ids_with_deg,
-                            img_ids=packed_img_ids,
+                            img_ids=img_ids,
                             deg_emb=deg_emb,
-                            lq_tensor=lq_tensors_concat,
+                            lq_tensor=torch.cat(condition_images, dim=0) if condition_images else None,
                             return_dict=False,
                         )[0]
-
                     model_pred = neg_model_pred + guidance_scale * (model_pred - neg_model_pred)
 
                 model_pred = model_pred[:, :current_latents.size(1)]
 
-                # 14. 单步推理：直接用 Flow Matching 公式逆推 x_0
-                # x_t = (1 - σ) * x_0 + σ * noise
-                # model_pred = noise - x_0  (velocity，训练时的 target)
-                # → x_0 = x_t - σ * model_pred
                 latents_dtype = current_latents.dtype
                 sigma_t = self._raw_sigmas[i].to(device=current_latents.device, dtype=current_latents.dtype)
                 current_latents = current_latents - sigma_t * model_pred
 
-                if current_latents.dtype != latents_dtype:
-                    if torch.backends.mps.is_available():
-                        current_latents = current_latents.to(latents_dtype)
+                if current_latents.dtype != latents_dtype and torch.backends.mps.is_available():
+                    current_latents = current_latents.to(latents_dtype)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -1252,10 +1219,8 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
                         callback_kwargs[k] = locals()[k]
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
                     current_latents = callback_outputs.pop("latents", current_latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+                progress_bar.update()
 
                 if XLA_AVAILABLE:
                     xm.mark_step()
@@ -1264,24 +1229,24 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
             del self._raw_sigmas
         self._current_timestep = None
 
-        # 15. After all steps: unpack latents, BN-denormalize, unpatchify, VAE decode
+        # 12. Decode: unpack -> BN-denormalize -> unpatchify -> VAE decode
         latent_height = 2 * (int(height) // (self.vae_scale_factor * 2))
         latent_width = 2 * (int(width) // (self.vae_scale_factor * 2))
-        hq_latents = self._unpack_latents_with_ids(
+        pred_latents = self._unpack_latents_with_ids(
             current_latents, img_ids, latent_height // 2, latent_width // 2
         )
 
-        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(hq_latents.device, hq_latents.dtype)
-        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
-            hq_latents.device, hq_latents.dtype
-        )
-        hq_latents = hq_latents * latents_bn_std + latents_bn_mean
-        hq_latents = self._unpatchify_latents(hq_latents)
-        # VAE decode
+        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(pred_latents.device, pred_latents.dtype)
+        latents_bn_std = torch.sqrt(
+            self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps
+        ).to(pred_latents.device, pred_latents.dtype)
+        pred_latents = pred_latents * latents_bn_std + latents_bn_mean
+        pred_latents = self._unpatchify_latents(pred_latents)
+
         if output_type == "latent":
-            image = hq_latents
+            image = pred_latents
         else:
-            image = self.vae.decode(hq_latents.to(dtype=self.vae.dtype), return_dict=False)[0]
+            image = self.vae.decode(pred_latents.to(dtype=self.vae.dtype), return_dict=False)[0]
             image = self.image_processor.postprocess(image, output_type=output_type)
 
         self.maybe_free_model_hooks()

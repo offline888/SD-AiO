@@ -1,9 +1,8 @@
 import argparse
 import os
-import sys
-import glob
-import yaml
 import re
+import sys
+import yaml
 
 import torch
 from diffusers import Flux2KleinIRPipeline
@@ -48,9 +47,16 @@ def parse_args(input_args=None):
     parser.add_argument("--num_inference_steps", type=int, default=1)
     parser.add_argument("--fixed_timestep", type=int, default=300)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--degradation_classifier_path", type=str, default=None)
+    parser.add_argument("--degradation_classifier_path", type=str, default=None, required=True)
     parser.add_argument("--dino_type", type=str, default="vits14")
     parser.add_argument("--num_deg_types", type=int, default=4)
+    parser.add_argument(
+        "--mod_lq_type",
+        type=str,
+        default="convnext",
+        choices=["convnext", "vae"],
+        help="Backbone type for FLUX2ModulationV2: 'convnext' (ConvNeXt-Small) or 'vae' (dedicated VAE encoder)",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
         "--dtype",
@@ -85,6 +91,7 @@ def build_inference_pipeline(
     device: str,
     dtype: torch.dtype,
     args: argparse.Namespace,
+    mod_lq_type: str = "convnext",
 ) -> Flux2KleinIRPipeline:
     pipe = Flux2KleinIRPipeline.from_pretrained(
         pretrained_model_path, torch_dtype=dtype
@@ -108,7 +115,7 @@ def build_inference_pipeline(
 
     pipe.eval()
 
-    _replace_modulation(pipe.transformer, device, dtype)
+    _replace_modulation(pipe.transformer, pipe.vae, device, dtype, mod_lq_type=mod_lq_type, vae_path=pretrained_model_path)
 
     class_emb = None
     if modulation_weights_path and os.path.exists(modulation_weights_path):
@@ -124,6 +131,9 @@ def build_inference_pipeline(
                 # Key format in transformer: "double_stream_modulation_img.linear.weight"
                 pipe.transformer.state_dict()[k].copy_(v)
                 loaded_mod_count += 1
+            elif k == "deg_embedding":
+                pipe.transformer.state_dict()[k].copy_(v)
+                print(f"[INFO] Loaded deg_embedding: shape={v.shape}")
             elif "class_embedding_U" in k:
                 class_emb = v
                 print(f"[INFO] Loaded class_embedding_U: shape={class_emb.shape}")
@@ -132,7 +142,7 @@ def build_inference_pipeline(
 
     # Print double_stream_modulation_img structure
     mod_img = pipe.transformer.double_stream_modulation_img
-    print(f"\n[INFO] double_stream_modulation_img structure:")
+    print("\n[INFO] double_stream_modulation_img structure:")
     print(f"  Type: {type(mod_img).__name__}")
     print(f"  dim: {mod_img.dim}, mod_param_sets: {mod_img.mod_param_sets}, n_blocks: {getattr(mod_img, 'n_blocks', 'N/A')}")
     for name, param in sorted(mod_img.named_parameters(), key=lambda x: x[0]):
@@ -143,31 +153,36 @@ def build_inference_pipeline(
         transformer=pipe.transformer,
         num_deg_types=num_deg_types,
         weight_dtype=dtype,
-        device=device,
         args=argparse.Namespace(
             degradation_classifier_path=degradation_classifier_path,
             dino_type=dino_type,
         ),
-        class_embedding_U=class_emb,
+        deg_embedding=None,
     )
     return pipe
 
 
-def _replace_modulation(transformer: Flux2Transformer2DModel, device, dtype):
+def _replace_modulation(
+    transformer: Flux2Transformer2DModel, vae, device, dtype, mod_lq_type: str = "convnext", vae_path: str = ""
+):
     if not hasattr(transformer, "double_stream_modulation_img"):
         return
     orig = transformer.double_stream_modulation_img
     if isinstance(orig, FLUX2ModulationV2):
         return
-    n_blocks = transformer.config.num_layers
+    use_conv = (mod_lq_type == "convnext")
+    use_vae = (mod_lq_type == "vae")
     new_mod = FLUX2ModulationV2(
         dim=orig.linear.in_features,
         mod_param_sets=orig.mod_param_sets,
         bias=orig.linear.bias is not None,
-        n_blocks=n_blocks,
+        use_block_emb=True,
+        use_conv=use_conv,
+        use_vae=use_vae,
+        vae_path=vae_path,
     ).to(device=device, dtype=dtype)
     transformer.double_stream_modulation_img = new_mod
-    print(f"[INFO] Replaced modulation with FLUX2ModulationV2 (n_blocks={n_blocks})")
+    print(f"[INFO] Replaced modulation with FLUX2ModulationV2 ({mod_lq_type})")
 
 
 def _nat_sort_key(s: str) -> list:
@@ -272,6 +287,7 @@ def main(args):
         device=args.device,
         dtype=dtype,
         args=args,
+        mod_lq_type=getattr(args, "mod_lq_type", "convnext"),
     )
 
     os.makedirs(args.output_dir, exist_ok=True)

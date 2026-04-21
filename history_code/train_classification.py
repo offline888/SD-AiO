@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
+from src.data.dataset import InterleavedShuffleDataset, MultiLabelClassification
+from src.networks.degnet import DegNet_CLIP, DegNet_DINO
 from torch.utils.data import ChainDataset, DataLoader
 from torchmetrics.classification import (
     MultilabelAccuracy,
@@ -22,9 +24,6 @@ from torchmetrics.classification import (
 )
 from torchvision.transforms import v2 as transforms
 from tqdm import tqdm
-
-from src.data.dataset import InterleavedShuffleDataset, MultiLabelClassification
-from src.networks.degnet import DegNet_CLIP, DegNet_DINO
 
 MODEL_FACTORY = {"DegNet_CLIP": DegNet_CLIP, "DegNet_DINO": DegNet_DINO}
 
@@ -59,7 +58,9 @@ class Trainer:
 
     def setup_dist(self) -> None:
         ddp_kwargs = DistributedDataParallelKwargs(
-            find_unused_parameters=self.config.accelerator.get("find_unused_parameters", False)
+            find_unused_parameters=self.config.accelerator.get(
+                "find_unused_parameters", False
+            )
         )
 
         self.accelerator = Accelerator(
@@ -74,14 +75,20 @@ class Trainer:
         self.unwrap_fn = self.accelerator.unwrap_model
 
     def init_logger(self) -> None:
-        self.ckpt_dir = os.path.join(self.config.experiments_dir, self.exp_name, "checkpoints")
+        self.ckpt_dir = os.path.join(
+            self.config.experiments_dir, self.exp_name, "checkpoints"
+        )
 
         if self.is_main and self.config.logging.use_swanlab:
-            self.log_dir = os.path.join(self.config.experiments_dir, self.exp_name, "logs")
+            self.log_dir = os.path.join(
+                self.config.experiments_dir, self.exp_name, "logs"
+            )
             swanlab_config = OmegaConf.to_container(self.config)
             swanlab_config["log_dir"] = self.log_dir
             os.makedirs(self.log_dir, exist_ok=True)
-            self.accelerator.init_trackers(self.config.logging.swanlab_project, swanlab_config)
+            self.accelerator.init_trackers(
+                self.config.logging.swanlab_project, swanlab_config
+            )
 
         if self.is_main:
             os.makedirs(self.ckpt_dir, exist_ok=True)
@@ -99,14 +106,20 @@ class Trainer:
                 ops.append(transforms.RandomHorizontalFlip())
             if data_config.get("use_rot"):
                 ops.append(transforms.RandomRotation(15))
-            ops.extend([
-                transforms.ToImage(),
-                transforms.ToDtype(torch.float32, scale=True),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
+            ops.extend(
+                [
+                    transforms.ToImage(),
+                    transforms.ToDtype(torch.float32, scale=True),
+                    transforms.Normalize(
+                        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                    ),
+                ]
+            )
 
             dataset_transforms = transforms.Compose(ops)
-            dataset = MultiLabelClassification(data_config, deg_types, dataset_transforms)
+            dataset = MultiLabelClassification(
+                data_config, deg_types, dataset_transforms
+            )
 
             if data_name.startswith("ValDataset"):
                 val_datasets.append(dataset)
@@ -118,23 +131,29 @@ class Trainer:
                     "Must start with 'TrainDataset' or 'ValDataset'."
                 )
 
-        self.datasets['train'] = train_datasets
-        self.datasets['val'] = val_datasets
+        self.datasets["train"] = train_datasets
+        self.datasets["val"] = val_datasets
 
         val_cfg = self.config.data.dataloader.val
-        val_loader = DataLoader(
-            ChainDataset(val_datasets),
-            batch_size=val_cfg.batch_size,
-            num_workers=val_cfg.get("num_workers", 4),
-            pin_memory=val_cfg.get("pin_memory", True),
-            persistent_workers=val_cfg.get("persistent_workers", True),
-            drop_last=False,
-            prefetch_factor=val_cfg.get("prefetch_factor", 2),
-        ) if val_datasets else None
+        val_loader = (
+            DataLoader(
+                ChainDataset(val_datasets),
+                batch_size=val_cfg.batch_size,
+                num_workers=val_cfg.get("num_workers", 4),
+                pin_memory=val_cfg.get("pin_memory", True),
+                persistent_workers=val_cfg.get("persistent_workers", True),
+                drop_last=False,
+                prefetch_factor=val_cfg.get("prefetch_factor", 2),
+            )
+            if val_datasets
+            else None
+        )
 
         train_cfg = self.config.data.dataloader.train
         train_loader = DataLoader(
-            InterleavedShuffleDataset(train_datasets, buffer_size=3000, seed=self.config.seed),
+            InterleavedShuffleDataset(
+                train_datasets, buffer_size=3000, seed=self.config.seed
+            ),
             shuffle=False,
             batch_size=train_cfg.batch_size,
             num_workers=train_cfg.get("num_workers", 8),
@@ -144,12 +163,14 @@ class Trainer:
             prefetch_factor=train_cfg.get("prefetch_factor", 4),
         )
 
-        self.dataloaders['train'] = train_loader
-        self.dataloaders['val'] = val_loader
+        self.dataloaders["train"] = train_loader
+        self.dataloaders["val"] = val_loader
 
     def build_model(self) -> None:
         Model = MODEL_FACTORY[self.config.network.type]
-        backbone_key = "clip_type" if "CLIP" in self.config.network.type else "dino_type"
+        backbone_key = (
+            "clip_type" if "CLIP" in self.config.network.type else "dino_type"
+        )
 
         self.model = Model(
             feature_dim=self.config.network.get("feature_dim", 512),
@@ -180,25 +201,38 @@ class Trainer:
         )
 
         total_steps = (
-            len(self.dataloaders['train']) // self.accelerator.gradient_accumulation_steps
+            len(self.dataloaders["train"])
+            // self.accelerator.gradient_accumulation_steps
         ) * self.config.train.num_epochs
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
             T_max=total_steps,
-            eta_min=self.config.train.scheduler.eta_min
+            eta_min=self.config.train.scheduler.eta_min,
         )
 
-        if self.dataloaders.get('val') is not None:
-            self.model, self.optimizer, self.dataloaders['train'], self.scheduler, self.dataloaders['val'] = \
-                self.accelerator.prepare(
-                    self.model, self.optimizer, self.dataloaders['train'],
-                    self.scheduler, self.dataloaders['val']
-                )
+        if self.dataloaders.get("val") is not None:
+            (
+                self.model,
+                self.optimizer,
+                self.dataloaders["train"],
+                self.scheduler,
+                self.dataloaders["val"],
+            ) = self.accelerator.prepare(
+                self.model,
+                self.optimizer,
+                self.dataloaders["train"],
+                self.scheduler,
+                self.dataloaders["val"],
+            )
         else:
-            self.model, self.optimizer, self.dataloaders['train'], self.scheduler = \
+            self.model, self.optimizer, self.dataloaders["train"], self.scheduler = (
                 self.accelerator.prepare(
-                    self.model, self.optimizer, self.dataloaders['train'], self.scheduler
+                    self.model,
+                    self.optimizer,
+                    self.dataloaders["train"],
+                    self.scheduler,
                 )
+            )
 
         for metric in self.metrics.values():
             metric.to(self.accelerator.device)
@@ -210,13 +244,12 @@ class Trainer:
             with self.accelerator.autocast():
                 logits = self.model(images)
                 probs = torch.softmax(logits, dim=-1)
-                loss = F.binary_cross_entropy(probs, labels, reduction='sum')
+                loss = F.binary_cross_entropy(probs, labels, reduction="sum")
 
             self.accelerator.backward(loss)
             if self.accelerator.sync_gradients:
                 self.accelerator.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.train.get("max_grad_norm", 1.0)
+                    self.model.parameters(), self.config.train.get("max_grad_norm", 1.0)
                 )
 
             self.optimizer.step()
@@ -243,7 +276,7 @@ class Trainer:
             metric.reset()
 
         self.model.eval()
-        for imgs, lbls in self.dataloaders['val']:
+        for imgs, lbls in self.dataloaders["val"]:
             with self.accelerator.autocast():
                 logits = self.model(imgs)
                 probs = torch.softmax(logits, dim=-1)[:, :, 0]
@@ -255,7 +288,9 @@ class Trainer:
                 for metric in self.metrics.values():
                     metric.update(gathered_probs, gathered_lbls)
 
-        results = {name: metric.compute().item() for name, metric in self.metrics.items()}
+        results = {
+            name: metric.compute().item() for name, metric in self.metrics.items()
+        }
         self.model.train()
 
         return results
@@ -278,9 +313,9 @@ class Trainer:
         for epoch in range(self.config.train.num_epochs):
             self.current_epoch = epoch + 1
             pbar = tqdm(
-                self.dataloaders['train'],
+                self.dataloaders["train"],
                 disable=not self.is_main,
-                desc=f"Epoch {self.current_epoch}"
+                desc=f"Epoch {self.current_epoch}",
             )
 
             for images, labels in pbar:
@@ -293,11 +328,13 @@ class Trainer:
                     )
 
             val_freq = self.config.val.get("val_freq", 1)
-            if self.dataloaders['val'] is not None and (epoch + 1) % val_freq == 0:
+            if self.dataloaders["val"] is not None and (epoch + 1) % val_freq == 0:
                 results = self.validation()
 
                 if self.is_main:
-                    metric_str = " | ".join([f"{m}: {results[m]:.4f}" for m in self.metrics.keys()])
+                    metric_str = " | ".join(
+                        [f"{m}: {results[m]:.4f}" for m in self.metrics.keys()]
+                    )
                     print(f"\n{'=' * 60}")
                     print(f"Epoch {self.current_epoch} Validation")
                     print(f"{'=' * 60}")
@@ -334,7 +371,7 @@ def main() -> None:
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
     trainer = Trainer(args)
