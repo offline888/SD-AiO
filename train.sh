@@ -3,7 +3,7 @@ export CUDA_VISIBLE_DEVICES=4
 NUM_GPUS=1
 PRETRAINED_MODEL_NAME_OR_PATH=/home/yhmi/data/model/flux.2-klein
 DATASETS_CONFIG=/home/yhmi/All_in_one/options/train/data.yaml
-OUTPUT_DIR=/home/yhmi/data/output/flux2_convnext_ft_1
+OUTPUT_DIR=/home/yhmi/data/output/flux2_convnext_ft_2
 DEGRADATION_CLASSIFIER_PATH=/home/yhmi/data/model/best_model.pth
 DINO_TYPE=/home/yhmi/data/model/dinov2-base
 
@@ -15,7 +15,7 @@ DINO_TYPE=/home/yhmi/data/model/dinov2-base
 
 # Training
 accelerate launch \
-    /home/yhmi/All_in_one/train_flux2_ir.py \
+    /home/yhmi/All_in_one/train.py \
     --pretrained_model_name_or_path "${PRETRAINED_MODEL_NAME_OR_PATH}" \
     --datasets_config "${DATASETS_CONFIG}" \
     --resolution 512 \

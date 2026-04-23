@@ -2,12 +2,9 @@ import os
 from typing import Callable
 
 import cv2
-import numpy as np
-import torch
+import torchvision.transforms as T
 from PIL import Image
 from torch.utils.data import Dataset
-import torchvision.transforms as T
-
 
 class PairedDataset(Dataset):
     def __init__(
@@ -31,11 +28,13 @@ class PairedDataset(Dataset):
         if custom_transforms is not None:
             self.transforms = custom_transforms
         else:
-            self.transforms = T.Compose([
-                T.Resize((resolution, resolution)),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
+            self.transforms = T.Compose(
+                [
+                    T.Resize((resolution, resolution)),
+                    T.ToTensor(),
+                    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ]
+            )
 
         self.lq_dir = os.path.abspath(lq_path)
         self.hq_dir = os.path.abspath(hq_path)
@@ -48,22 +47,24 @@ class PairedDataset(Dataset):
         self.total_num_pairs = int(self.num_pairs * self.enlarge_ratio)
 
     def _load_pairs(self):
-        valid_ext = ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')
-        
+        valid_ext = (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG")
+
         def get_files(directory):
             return {
                 os.path.splitext(f)[0]: f
                 for f in os.listdir(directory)
                 if f.lower().endswith(valid_ext)
             }
-        
+
         hq_files = get_files(self.hq_dir)
         lq_files = get_files(self.lq_dir)
-        
+
         common = sorted(set(hq_files) & set(lq_files))
         return [
-            (os.path.join(self.hq_dir, hq_files[k]),
-             os.path.join(self.lq_dir, lq_files[k]))
+            (
+                os.path.join(self.hq_dir, hq_files[k]),
+                os.path.join(self.lq_dir, lq_files[k]),
+            )
             for k in common
         ]
 
@@ -86,13 +87,13 @@ class PairedDataset(Dataset):
         hq_path, lq_path = self.pairs[pair_idx]
 
         hq_img = self._load_image(hq_path)  # PIL
-        lq_img = self._load_image(lq_path)  
+        lq_img = self._load_image(lq_path)
 
         hq_tensor = self.transforms(hq_img)
         lq_tensor = self.transforms(lq_img)
 
         return {
-            "hq_pixel_values": hq_tensor,  # [3, H, W]
+            "hq_pixel_values": hq_tensor,  
             "lq_pixel_values": lq_tensor,
             "prompt": self.prompt,
             "dataset_idx": self.dataset_idx,
