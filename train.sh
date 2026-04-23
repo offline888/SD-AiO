@@ -1,9 +1,9 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=4
 NUM_GPUS=1
 PRETRAINED_MODEL_NAME_OR_PATH=/home/yhmi/data/model/flux.2-klein
 DATASETS_CONFIG=/home/yhmi/All_in_one/options/train/data.yaml
-OUTPUT_DIR=/home/yhmi/data/output/flux2_lora
+OUTPUT_DIR=/home/yhmi/data/output/flux2_convnext_ft_1
 DEGRADATION_CLASSIFIER_PATH=/home/yhmi/data/model/best_model.pth
 DINO_TYPE=/home/yhmi/data/model/dinov2-base
 
@@ -14,7 +14,8 @@ DINO_TYPE=/home/yhmi/data/model/dinov2-base
 #--main_training_function=main \
 
 # Training
-accelerate launch /home/yhmi/All_in_one/train_flux2_ir.py \
+accelerate launch \
+    /home/yhmi/All_in_one/train_flux2_ir.py \
     --pretrained_model_name_or_path "${PRETRAINED_MODEL_NAME_OR_PATH}" \
     --datasets_config "${DATASETS_CONFIG}" \
     --resolution 512 \
@@ -23,20 +24,20 @@ accelerate launch /home/yhmi/All_in_one/train_flux2_ir.py \
     --gradient_accumulation_steps 8 \
     --num_train_epochs 10 \
     --max_train_steps 10000 \
-    --save_checkpointing_steps 5 \
-    --val_monitor_steps 5 \
+    --save_checkpointing_steps 2000 \
+    --val_monitor_steps 100 \
     --learning_rate 2e-4 \
     --optimizer AdamW \
     --lr_scheduler cosine \
     --lr_warmup_steps 2000 \
     --guidance_scale 3.5 \
-    --fixed_timestep 500 \
+    --fixed_timestep 100 \
     --num_inference_steps 1 \
     --degradation_classifier_path "${DEGRADATION_CLASSIFIER_PATH}" \
     --dino_type "${DINO_TYPE}" \
     --num_deg_types 4 \
     --mod_lq_type convnext \
-    --dataloader_num_workers 64 \
+    --dataloader_num_workers 32 \
     --output_dir "${OUTPUT_DIR}" \
     --logging_dir "${OUTPUT_DIR}/logs" \
     --report_to swanlab \

@@ -214,14 +214,21 @@ class FLUX2ModulationV2(nn.Module):
     ) -> torch.Tensor:
         B = temb.size(0)
 
+        # Detect the target dtype from any of our linear weights (these are
+        # cast to bf16/fp16 before prepare() and stay that way).
+        w_dtype = self.linear.weight.dtype
+
         if self.use_block_emb and block_idx is not None:
             if isinstance(block_idx, int):
                 block_tensor = torch.tensor([block_idx], dtype=torch.long, device=temb.device)
             else:
                 block_tensor = block_idx.long().to(device=temb.device)
             bemb = self.block_proj(block_tensor)
-            bemb = self.block_embedder(bemb)
-            temb = temb + bemb
+            # Cast to bf16 so matmuls use the bf16 paths inside block_embedder
+            # (weights are bf16, input must match).
+            bemb = self.block_embedder(bemb.to(dtype=w_dtype))
+            # temb is float32 from Flux2TimestepGuidanceEmbeddings; cast it.
+            temb = (temb.to(dtype=w_dtype) + bemb)
 
         mod_time = self.act_fn(temb)
         mod_time = self.linear(mod_time)
@@ -428,6 +435,8 @@ def validate(
     global_step: int,
 ):
     os.makedirs(output_dir, exist_ok=True)
+    step_dir = os.path.join(output_dir, f"step_{global_step:06d}")
+    os.makedirs(step_dir, exist_ok=True)
 
     pipeline.eval()
 
@@ -435,12 +444,10 @@ def validate(
     IMGNET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(device)
 
     with torch.no_grad():
-        rows = []
         for item in val_items:
             lq_tensor = item["lq_pixel_values"].to(device)
             hq_tensor = item["hq_pixel_values"].to(device)
 
-            # [C,H,W] ImageNet-normed tensor -> [0,1] -> PIL (pipeline internally normalises)
             lq_pil = TF.to_pil_image((lq_tensor * IMGNET_STD + IMGNET_MEAN).clamp(0, 1))
 
             pred_output = pipeline(
@@ -452,7 +459,6 @@ def validate(
                 output_type="np",
                 return_dict=True,
             )
-            # Flux2PipelineOutput.images: list[np.ndarray], each [H,W,3] in [0,1]
             pred_np = pred_output.images[0]
             pred_tensor = torch.from_numpy(pred_np).permute(2, 0, 1)
 
@@ -460,12 +466,11 @@ def validate(
             hq_vis = (hq_tensor.float().to(device) * IMGNET_STD + IMGNET_MEAN).clamp(0, 1).cpu()
             pred_vis = pred_tensor.clamp(0, 1)
 
-            rows.append(torch.cat([lq_vis, pred_vis, hq_vis], dim=2))
-
-    grid = torch.cat(rows, dim=1)
-    Image.fromarray((grid.permute(1, 2, 0).numpy() * 255).astype("uint8")).save(
-        os.path.join(output_dir, f"step_{global_step:06d}.png")
-    )
+            grid = torch.cat([lq_vis, pred_vis, hq_vis], dim=2)
+            dataset_label = item.get("label", "unknown")
+            Image.fromarray((grid.permute(1, 2, 0).numpy() * 255).astype("uint8")).save(
+                os.path.join(step_dir, f"{dataset_label}.png")
+            )
 
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
@@ -505,7 +510,8 @@ def main(args):
         subfolder="tokenizer",
     )
 
-    weight_dtype = torch.float32
+    weight_dtype = torch.bfloat16
+
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
