@@ -1188,6 +1188,74 @@ class Flux2Transformer2DModel(
 
         self.gradient_checkpointing = False
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, subfolder=None, torch_dtype=None, **kwargs):
+        import json
+        import os
+        from pathlib import Path
+        from safetensors.torch import load_file
+
+        if subfolder is None:
+            config_path = pretrained_model_name_or_path
+            model_path = pretrained_model_name_or_path
+        else:
+            config_path = os.path.join(pretrained_model_name_or_path, subfolder)
+            model_path = config_path
+
+        # Load config
+        config_file = os.path.join(config_path, "config.json")
+        with open(config_file) as f:
+            config_dict = json.load(f)
+
+        # Load model weights (safetensors or bin)
+        model_files = list(Path(model_path).glob("*.safetensors"))
+        if model_files:
+            state_dict = {}
+            for sf in model_files:
+                state_dict.update(load_file(sf, device="cpu"))
+        else:
+            bin_files = list(Path(model_path).glob("*.bin"))
+            if not bin_files:
+                raise FileNotFoundError(f"No model files found in {model_path}")
+            state_dict = {}
+            for bf in bin_files:
+                sd = torch.load(bf, map_location="cpu", weights_only=True)
+                state_dict.update(sd)
+
+        # Extract inner_dim from config
+        num_attention_heads = config_dict.get("num_attention_heads", 48)
+        attention_head_dim = config_dict.get("attention_head_dim", 128)
+        inner_dim = num_attention_heads * attention_head_dim
+
+        # Build model
+        config_kwargs = {
+            "patch_size": config_dict.get("patch_size", 1),
+            "in_channels": config_dict.get("in_channels", 128),
+            "out_channels": config_dict.get("out_channels"),
+            "num_layers": config_dict.get("num_layers", 8),
+            "num_single_layers": config_dict.get("num_single_layers", 48),
+            "num_attention_heads": num_attention_heads,
+            "attention_head_dim": attention_head_dim,
+            "joint_attention_dim": config_dict.get("joint_attention_dim", 15360),
+            "timestep_guidance_channels": config_dict.get("timestep_guidance_channels", 256),
+            "mlp_ratio": config_dict.get("mlp_ratio", 3.0),
+            "axes_dims_rope": tuple(config_dict.get("axes_dims_rope", [32, 32, 32, 32])),
+            "rope_theta": config_dict.get("rope_theta", 2000),
+            "eps": config_dict.get("eps", 1e-6),
+            "guidance_embeds": config_dict.get("guidance_embeds", True),
+        }
+        model = cls(**config_kwargs)
+        if torch_dtype is not None:
+            model = model.to(dtype=torch_dtype)
+
+        # Load weights
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[from_pretrained] Missing keys: {missing}")
+        if unexpected:
+            print(f"[from_pretrained] Unexpected keys (ignored): {unexpected}")
+        return model
+
     _skip_keys = ["kv_cache"]
 
     @apply_lora_scale("joint_attention_kwargs")
@@ -1348,7 +1416,8 @@ class Flux2Transformer2DModel(
         # 6. Single Stream Transformer Blocks
         for index_block, block in enumerate(self.single_transformer_blocks):
             # Per-block modulation: same shared module, different block_idx
-            single_stream_mod = self.single_stream_modulation(lq_tensor, temb, index_block)
+            num_concat_tokens = 1537
+            single_stream_mod = self.single_stream_modulation(lq_tensor, temb, index_block, seq_len=num_concat_tokens)
 
             if kv_cache_mode is not None and kv_cache is not None:
                 kv_attn_kwargs_single["kv_cache"] = kv_cache.get_single(index_block)

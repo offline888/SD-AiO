@@ -9,7 +9,6 @@ import torch.utils.data
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers import FlowMatchEulerDiscreteScheduler
-from diffusers.models.transformers import Flux2Transformer2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_loss_weighting_for_sd3, free_memory
 from diffusers.utils import check_min_version
@@ -30,9 +29,9 @@ from src.flux2.pipelines.latent_utils import (
     unpack_latents_with_ids,
 )
 from src.flux2.pipelines.text_encoder import compute_text_embeddings
+from src.flux2.transformer_flux2 import Flux2Transformer2DModel
 from src.utils.log import log_once
 
-check_min_version("0.38.0.dev0")
 logger = logging.getLogger(__name__)
 
 
@@ -102,6 +101,7 @@ class Trainer:
             self.args.pretrained_model_name_or_path,
             subfolder="scheduler",
         )
+        self._original_sigmas = self.noise_scheduler.sigmas.clone()
 
         self.vae = self._load_vae()
         self.latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(self.accelerator.device)
@@ -332,6 +332,9 @@ class Trainer:
             shuffle=True,
             collate_fn=collate_fn,
             num_workers=self.args.dataloader_num_workers,
+            pin_memory=True,
+            prefetch_factor=4,
+            persistent_workers=True,
             drop_last=True,
         )
 
@@ -359,32 +362,42 @@ class Trainer:
         self.monitor_items = []
         self.monitor_output_dir = None
 
+        num_val_samples = getattr(self.args, "num_val_samples_per_dataset", 1)
+        if num_val_samples < 1:
+            num_val_samples = 1
+
         if self.val_monitor_steps > 0 and self.accelerator.is_main_process:
             data_config = OmegaConf.load(self.args.datasets_config)
             train_datasets_cfg = [
                 data_config[k] for k in data_config.keys() if k.startswith("Train")
             ]
             for ds_idx, (ds, cfg) in enumerate(zip(self.train_datasets, train_datasets_cfg)):
-                hq_path, lq_path = ds.pairs[0]
-                hq_pil = ds._load_image(hq_path)
-                lq_pil = ds._load_image(lq_path)
-                lq_t = ds.transforms(lq_pil)
-                hq_t = ds.transforms(hq_pil)
-                self.monitor_items.append({
-                    "label": cfg.deg_type,
-                    "lq_pixel_values": lq_t,
-                    "hq_pixel_values": hq_t.clone(),
-                    "prompt_embeds": self.prompt_embeds_cache[ds_idx].squeeze(0),
-                    "text_ids": self.text_ids_cache[ds_idx].squeeze(0),
-                })
-                log_once(
-                    f"[ValMonitor] ds={ds_idx} ({cfg.deg_type}): lq={lq_path}",
-                    self.accelerator,
-                )
+                num_available = len(ds.pairs)
+                num_to_sample = min(num_val_samples, num_available)
+
+                for sample_idx in range(num_to_sample):
+                    hq_path, lq_path = ds.pairs[sample_idx]
+                    hq_pil = ds._load_image(hq_path)
+                    lq_pil = ds._load_image(lq_path)
+                    lq_t = ds.transforms(lq_pil)
+                    hq_t = ds.transforms(hq_pil)
+                    self.monitor_items.append({
+                        "label": f"{cfg.deg_type}_{sample_idx}",
+                        "lq_pixel_values": lq_t,
+                        "hq_pixel_values": hq_t.clone(),
+                        "prompt_embeds": self.prompt_embeds_cache[ds_idx].squeeze(0),
+                        "text_ids": self.text_ids_cache[ds_idx].squeeze(0),
+                    })
+                    log_once(
+                        f"[ValMonitor] ds={ds_idx} ({cfg.deg_type}) "
+                        f"sample {sample_idx + 1}/{num_to_sample}: lq={lq_path}",
+                        self.accelerator,
+                    )
             self.monitor_output_dir = os.path.join(self.args.output_dir, "val_monitor")
             log_once(
                 f"[ValMonitor] Will snapshot every {self.val_monitor_steps} steps "
-                f"to {self.monitor_output_dir}",
+                f"to {self.monitor_output_dir} "
+                f"({num_to_sample} image(s) per dataset, total {len(self.monitor_items)})",
                 self.accelerator,
             )
 
@@ -514,12 +527,11 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
-        sigmas = self.noise_scheduler.sigmas.to(
+        sigmas = self._original_sigmas.to(
             device=self.accelerator.device, dtype=dtype
         )
-        schedule_timesteps = self.noise_scheduler.timesteps.to(self.accelerator.device)
         timesteps = timesteps.to(self.accelerator.device)
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+        step_indices = timesteps.long()
         sigma = sigmas[step_indices].flatten()
         while len(sigma.shape) < n_dim:
             sigma = sigma.unsqueeze(-1)
@@ -560,6 +572,7 @@ class Trainer:
 
         model_input = patchify_latents(model_input)
         model_input = (model_input - self.latents_bn_mean) / self.latents_bn_std
+        lq_input = model_input.clone()
         hq_target = patchify_latents(hq_latent)
         hq_target = (hq_target - self.latents_bn_mean) / self.latents_bn_std
         model_input_ids = prepare_latent_ids(model_input).to(model_input.device)
@@ -621,7 +634,8 @@ class Trainer:
         weighting = compute_loss_weighting_for_sd3(
             weighting_scheme="none", sigmas=sigmas
         )
-        target = noise - hq_target
+        # fm target:$\varepsilon$$\varepsilon + \frac{(1-t)x^{\mathrm{L}} - x^{\mathrm{H}}}{t}$
+        target = noise + ((1 - sigmas) * lq_input - hq_target) / sigmas
         loss = torch.mean(
             (
                 weighting.float() * (model_pred.float() - target.float()) ** 2
@@ -758,7 +772,7 @@ class Trainer:
                         self.accelerator.save_state(save_path)
                         log_once(f"Saved state to {save_path}", self.accelerator)
 
-                    if self.val_monitor_steps > 0 and global_step % self.val_monitor_steps == 0:
+                    if self.val_monitor_steps > 0 and global_step % self.val_monitor_steps == 0 and self.accelerator.is_main_process:
                         self._run_validation(global_step)
 
                     logs = {

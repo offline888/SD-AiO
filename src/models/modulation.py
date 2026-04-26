@@ -3,6 +3,7 @@ import argparse
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models
 
 from diffusers import AutoencoderKLFlux2
@@ -143,6 +144,7 @@ class FLUX2ModulationV2(nn.Module):
         lq_tensor: torch.Tensor,
         temb: torch.Tensor,
         block_idx: int | None = None,
+        seq_len: int | None = None,
     ) -> torch.Tensor:
         B = temb.size(0)
         w_dtype = self.linear.weight.dtype
@@ -158,11 +160,10 @@ class FLUX2ModulationV2(nn.Module):
 
         mod_time = self.act_fn(temb)
         mod_time = self.linear(mod_time)
-        mod = mod_time.unsqueeze(1)
 
+        lq_mod = None
         if lq_tensor is not None:
             if self.use_conv and not self.use_vae:
-                # Ensure LQ tensor matches ConvNeXt dtype (bfloat16)
                 lq_tensor = lq_tensor.to(dtype=torch.bfloat16)
                 x = self.conv_stem_s1(lq_tensor)
                 x = self.conv_time_mod1(x, temb)
@@ -173,7 +174,6 @@ class FLUX2ModulationV2(nn.Module):
 
                 lq_mod = self.feat_proj(x)
                 lq_mod = lq_mod.permute(0, 2, 3, 1).reshape(B, -1, 3 * self.mod_param_sets * self.dim)
-                mod = mod + lq_mod
 
             elif self.use_vae:
                 encoder = self.vae.encoder
@@ -196,7 +196,22 @@ class FLUX2ModulationV2(nn.Module):
                 lq_feat, _ = torch.chunk(x, 2, dim=1)
                 lq_mod = self.vae_proj(lq_feat)
                 lq_mod = lq_mod.permute(0, 2, 3, 1).reshape(B, -1, 3 * self.mod_param_sets * self.dim)
+
+        if seq_len is not None:
+            mod = mod_time.unsqueeze(1).expand(B, seq_len, -1)
+            if lq_mod is not None:
+                lq_mod_up = F.interpolate(
+                    lq_mod.transpose(1, 2),
+                    size=seq_len,
+                    mode='linear',
+                    align_corners=False,
+                ).transpose(1, 2)
+                mod = mod + lq_mod_up
+        else:
+            mod = mod_time.unsqueeze(1)
+            if lq_mod is not None:
                 mod = mod + lq_mod
+
         return mod
 
     @staticmethod

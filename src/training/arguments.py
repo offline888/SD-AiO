@@ -38,6 +38,13 @@ def parse_args(input_args=None):
         default=None,
         help="Set to 0 to disable in-training visual monitoring.",
     )
+    parser.add_argument(
+        "--num_val_samples_per_dataset",
+        type=int,
+        default=1,
+        help="Number of validation images to sample from each dataset. "
+             "If > 1, images are selected deterministically by index (not by seed).",
+    )
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)

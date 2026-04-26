@@ -1137,8 +1137,17 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
             img_ids = img_ids.repeat(num_images_per_prompt, 1, 1)
 
         # 8. Compute noise level and prepare noisy latents
-        fixed_idx = min(fixed_timestep, len(self.scheduler.sigmas) - 1)
-        sigma_start = self.scheduler.sigmas[fixed_idx].item()
+        # NOTE: Use the ORIGINAL sigmas (length 1000) for fixed_idx lookup.
+        # After the first set_timesteps call, scheduler.sigmas is overwritten
+        # to [shifted_sigma, 0.0] with length 2, which breaks subsequent calls.
+        # We must save the original sigmas before any set_timesteps modifies them.
+        if not hasattr(self, "_original_sigmas") or self._original_sigmas is None:
+            self._original_sigmas = self.scheduler.sigmas.clone()
+        original_sigmas = self._original_sigmas
+        fixed_idx = min(fixed_timestep, len(original_sigmas) - 1)
+        sigma_start = original_sigmas[fixed_idx].item()
+        # Use raw timestep/1000 for model (matching training), NOT scheduler's shifted value
+        model_timestep = fixed_idx / 1000.0
         noise = torch.randn_like(lq_latents_packed) if lq_latents_packed is not None else None
         current_latents = (1.0 - sigma_start) * lq_latents_packed + sigma_start * noise
 
@@ -1174,12 +1183,13 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
                     continue
 
                 self._current_timestep = t
-                timestep = t.expand(bsz).to(current_latents.dtype)
+                # Use raw fixed_idx/1000 for model (matching training), NOT shifted t/1000
+                timestep = torch.full((bsz,), model_timestep, device=device, dtype=current_latents.dtype)
 
                 with self.transformer.cache_context("cond"):
                     model_pred = self.transformer(
                         hidden_states=current_latents,
-                        timestep=timestep / 1000,
+                        timestep=timestep,
                         guidance=cfg_guidance,
                         encoder_hidden_states=prompt_embeds,
                         txt_ids=text_ids_with_deg,
@@ -1193,7 +1203,7 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
                     with self.transformer.cache_context("uncond"):
                         neg_model_pred = self.transformer(
                             hidden_states=current_latents,
-                            timestep=timestep / 1000,
+                            timestep=timestep,
                             guidance=None,
                             encoder_hidden_states=negative_prompt_embeds,
                             txt_ids=neg_text_ids_with_deg,
