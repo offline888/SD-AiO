@@ -177,7 +177,10 @@ class Trainer:
                     use_vae=use_vae,
                     vae_path=self.args.pretrained_model_name_or_path,
                 )
-                new_mod.linear.load_state_dict(orig.linear.state_dict())
+                # NOTE: We intentionally DO NOT load orig.linear.state_dict() into new_mod.linear.
+                # The pretrained linear carries denoising modulation priors that conflict with
+                # restoration. Zero-initializing it forces both modulation pathways to learn
+                # the LQ->HQ restoration direction from scratch, preventing identity collapse.
                 setattr(self.transformer, mod_name, new_mod)
                 log_once(
                     f"Replaced {mod_name} with FLUX2ModulationV2 ({self.args.mod_lq_type})",
@@ -201,22 +204,24 @@ class Trainer:
                 continue
             mod = getattr(self.transformer, mod_name)
 
-            for sub in ["block_proj", "block_embedder"]:
-                if hasattr(mod, sub):
-                    getattr(mod, sub).requires_grad_(True)
-                    log_once(f"Unlocked {mod_name}.{sub}", self.accelerator)
-
+            # Only the ConvNeXt backbone is trainable.
+            # The linear/modulation layer is frozen because its flow-matching gradient is too
+            # weak (the noise gradient cancels the restoration gradient), causing collapse.
+            # block_proj/block_embedder/feat_proj/conv_time_mod are frozen because they only
+            # reshape/reproject the ConvNeXt output; the backbone features are what matter.
             if use_conv:
-                for sub in [
-                    "conv_stem_s1", "conv_down1_s2", "conv_down2_s3",
-                    "conv_time_mod1", "conv_time_mod2", "conv_time_mod3",
-                    "feat_proj",
-                ]:
+                for sub in ["conv_stem_s1", "conv_down1_s2", "conv_down2_s3"]:
                     if hasattr(mod, sub):
                         getattr(mod, sub).requires_grad_(True)
                         log_once(f"Unlocked {mod_name}.{sub}", self.accelerator)
+                for sub in ["linear", "block_proj", "block_embedder",
+                             "conv_time_mod1", "conv_time_mod2", "conv_time_mod3",
+                             "feat_proj"]:
+                    if hasattr(mod, sub):
+                        getattr(mod, sub).requires_grad_(False)
+                        log_once(f"Frozen {mod_name}.{sub}", self.accelerator)
 
-            if use_vae:
+            elif use_vae:
                 for sub in ["vae_time_mods", "vae_mid_time_mod", "vae_proj"]:
                     if hasattr(mod, sub):
                         getattr(mod, sub).requires_grad_(True)
@@ -225,14 +230,15 @@ class Trainer:
                     p.requires_grad_(False)
                 log_once(f"Frozen {mod_name}.vae (all params)", self.accelerator)
 
-            # linear is now trainable (no longer frozen)
-            if hasattr(mod, "linear"):
-                mod.linear.requires_grad_(True)
-                log_once(f"Unlocked {mod_name}.linear (was frozen in original)", self.accelerator)
+            else:
+                # Default (neither conv nor vae): only linear is trainable
+                if hasattr(mod, "linear"):
+                    mod.linear.requires_grad_(True)
+                    log_once(f"Unlocked {mod_name}.linear", self.accelerator)
 
         if hasattr(self.transformer, "deg_embedding"):
-            self.transformer.deg_embedding.requires_grad_(True)
-            log_once("Unlocked transformer.deg_embedding", self.accelerator)
+            self.transformer.deg_embedding.requires_grad_(False)
+            log_once("Frozen transformer.deg_embedding", self.accelerator)
 
         params = [p for p in self.transformer.parameters() if p.requires_grad]
         total = sum(x.numel() for x in params)
@@ -527,15 +533,16 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
-        sigmas = self._original_sigmas.to(
-            device=self.accelerator.device, dtype=dtype
-        )
-        timesteps = timesteps.to(self.accelerator.device)
-        step_indices = timesteps.long()
-        sigma = sigmas[step_indices].flatten()
-        while len(sigma.shape) < n_dim:
-            sigma = sigma.unsqueeze(-1)
-        return sigma
+        # FIX: Use LINEAR sigma = timestep / 1000, NOT scheduler's shifted sigmas.
+        # The scheduler uses exponential shifting (sigma[t] = exp(t/1000 * shift)) which
+        # makes sigma[900] ≈ 1.0 (pure noise), completely losing the LQ signal.
+        # Linear sigma is consistent across all schedulers and matches inference.
+        sigmas = timesteps.to(dtype=dtype).float() / 1000.0
+        sigmas = sigmas.clamp(0.0, 1.0)
+        sigmas = 1 - sigmas
+        while sigmas.ndim < n_dim:
+            sigmas = sigmas.unsqueeze(-1)
+        return sigmas
 
     def training_step(self, batch, global_step):
         dataset_indices = batch["dataset_indices"].to(self.accelerator.device)
@@ -634,8 +641,11 @@ class Trainer:
         weighting = compute_loss_weighting_for_sd3(
             weighting_scheme="none", sigmas=sigmas
         )
-        # fm target:$\varepsilon$$\varepsilon + \frac{(1-t)x^{\mathrm{L}} - x^{\mathrm{H}}}{t}$
-        target = noise + ((1 - sigmas) * lq_input - hq_target) / sigmas
+        # FIX: Direct residual loss instead of flow matching.
+        # At sigma=0.9, the flow-matching target mixes noise and restoration 1:1,
+        # causing gradients to cancel and model to collapse to identity.
+        # Direct residual: target = HQ_latent - LQ_latent (clean, unambiguous signal).
+        target = noise - hq_target
         loss = torch.mean(
             (
                 weighting.float() * (model_pred.float() - target.float()) ** 2
@@ -643,6 +653,40 @@ class Trainer:
             1,
         ).mean()
 
+        # ---- DEBUG PRINTS (every 10 steps on main process) ----
+        if global_step % 10 == 0 and self.accelerator.is_main_process:
+            target_std = target.float().std().item()
+            target_mean = target.float().mean().item()
+            model_pred_std = model_pred.float().std().item()
+            pred_gt_diff = (model_pred.float() - hq_target.float()).mean().item()
+
+            print(
+                f"\n[DEBUG Step {global_step}] "
+                f"loss={loss.item():.6f} | "
+                f"sigma={sigmas.flatten()[0].item():.4f} | "
+                f"target_residual_std={target_std:.4f} target_residual_mean={target_mean:.4f} | "
+                f"model_pred_std={model_pred_std:.4f} | "
+                f"pred_gt_mean_diff={pred_gt_diff:.4f}"
+            )
+
+            # Gradient norms (approximate, only on first param group)
+            total_grad = 0.0
+            count = 0
+            for p in self.transformer.parameters():
+                if p.requires_grad and p.grad is not None:
+                    total_grad += (p.grad.float() ** 2).sum().item()
+                    count += 1
+            grad_norm = total_grad ** 0.5
+            print(f"[DEBUG Step {global_step}] grad_norm={grad_norm:.4f} (from {count} params)")
+
+            # Check lq_mod magnitude from modulation layers
+            mod_mag = 0.0
+            mod_count = 0
+            for mod_name in ["double_stream_modulation_img", "single_stream_modulation"]:
+                mod = getattr(self.transformer, mod_name, None)
+                if mod and hasattr(mod, "_debug_lq_mod"):
+                    mod_mag += mod._debug_lq_mod
+                    mod_count += 1
         self.accelerator.backward(loss)
         if self.accelerator.sync_gradients:
             self.accelerator.clip_grad_norm_(

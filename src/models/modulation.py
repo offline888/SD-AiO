@@ -28,11 +28,6 @@ class EfficientConvProj(nn.Module):
         self.act = nn.SiLU()
         self.project = nn.Conv2d(bottleneck_dim, out_ch, kernel_size=1)
 
-        nn.init.zeros_(self.expand.weight)
-        nn.init.zeros_(self.expand.bias)
-        nn.init.zeros_(self.project.weight)
-        nn.init.zeros_(self.project.bias)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.expand(x)
         x = self.dwconv(x)
@@ -77,6 +72,12 @@ class FLUX2ModulationV2(nn.Module):
 
         self.act_fn = nn.SiLU()
         self.linear = nn.Linear(dim, 3 * mod_param_sets * dim, bias=bias)
+        # Zero-init: block pretrained denoising modulation weights from loading.
+        # This forces the modulation pathway to learn the restoration direction from scratch,
+        # preventing the pretrained denoising direction from causing identity collapse.
+        nn.init.zeros_(self.linear.weight)
+        if bias:
+            nn.init.zeros_(self.linear.bias)
 
         if self.use_block_emb:
             self.block_proj = Timesteps(

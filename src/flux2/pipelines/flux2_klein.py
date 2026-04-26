@@ -474,7 +474,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         image_latents = self._patchify_latents(image_latents)
 
         latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(image_latents.device, image_latents.dtype)
-        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps)
+        latents_bn_std = torch.sqrt(
+            self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps
+        ).to(image_latents.device, image_latents.dtype)
         image_latents = (image_latents - latents_bn_mean) / latents_bn_std
 
         return image_latents
@@ -1137,17 +1139,12 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
             img_ids = img_ids.repeat(num_images_per_prompt, 1, 1)
 
         # 8. Compute noise level and prepare noisy latents
-        # NOTE: Use the ORIGINAL sigmas (length 1000) for fixed_idx lookup.
-        # After the first set_timesteps call, scheduler.sigmas is overwritten
-        # to [shifted_sigma, 0.0] with length 2, which breaks subsequent calls.
-        # We must save the original sigmas before any set_timesteps modifies them.
-        if not hasattr(self, "_original_sigmas") or self._original_sigmas is None:
-            self._original_sigmas = self.scheduler.sigmas.clone()
-        original_sigmas = self._original_sigmas
-        fixed_idx = min(fixed_timestep, len(original_sigmas) - 1)
-        sigma_start = original_sigmas[fixed_idx].item()
-        # Use raw timestep/1000 for model (matching training), NOT scheduler's shifted value
-        model_timestep = fixed_idx / 1000.0
+        # FIX: Use LINEAR sigma = fixed_idx / 1000, NOT scheduler's shifted sigmas.
+        # Linear sigma is consistent between training and inference.
+        fixed_idx = min(fixed_timestep, 999)
+        sigma_start = fixed_idx / 1000.0
+        # Linear model_timestep (matches training's timestep / 1000)
+        model_timestep = sigma_start
         noise = torch.randn_like(lq_latents_packed) if lq_latents_packed is not None else None
         current_latents = (1.0 - sigma_start) * lq_latents_packed + sigma_start * noise
 
@@ -1169,7 +1166,6 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
             sigmas=deno_sigmas,
             mu=compute_empirical_mu(image_seq_len=lq_latents_packed.shape[1], num_steps=num_inference_steps),
         )
-        self._raw_sigmas = torch.from_numpy(deno_sigmas).to(dtype=torch.float32, device=device)
         timesteps = self.scheduler.timesteps
         self.scheduler.set_begin_index(0)
         self._num_timesteps = len(timesteps)
@@ -1217,8 +1213,10 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
                 model_pred = model_pred[:, :current_latents.size(1)]
 
                 latents_dtype = current_latents.dtype
-                sigma_t = self._raw_sigmas[i].to(device=current_latents.device, dtype=current_latents.dtype)
-                current_latents = current_latents - sigma_t * model_pred
+                # Direct residual loss: model predicts (HQ - LQ - noise).
+                # Inference: LQ_noisy + model_pred = LQ + (HQ - LQ - noise) = HQ - noise
+                # Single-step: no need for sigma_t scaling, just add the residual.
+                current_latents = current_latents + model_pred
 
                 if current_latents.dtype != latents_dtype and torch.backends.mps.is_available():
                     current_latents = current_latents.to(latents_dtype)
@@ -1235,8 +1233,6 @@ class Flux2KleinIRPipeline(Flux2KleinPipeline):
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
-        if hasattr(self, "_raw_sigmas"):
-            del self._raw_sigmas
         self._current_timestep = None
 
         # 12. Decode: unpack -> BN-denormalize -> unpatchify -> VAE decode
