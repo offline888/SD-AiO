@@ -1,40 +1,40 @@
-# Multi-degradation restoration task config
+# Multi-degradation restoration — Rain / Haze / Lowlight
 # lq_path / gt_path point to directories; images matched by stem.
 
 train:
-  - name: Train_Derain
+  - name: Train_Rain
     deg_type: rain
-    lq_path: /path/to/derain/LQ_train
-    gt_path: /path/to/derain/GT
+    lq_path: /root/shared-nvme/data/10Rain/LQ_train
+    gt_path: /root/shared-nvme/data/10Rain/GT
     prompt: "a high quality clean image without rain streaks, clear visibility"
 
-  - name: Train_Dehaze
+  - name: Train_Haze
     deg_type: haze
-    lq_path: /path/to/dehaze/LQ_train
-    gt_path: /path/to/dehaze/GT
+    lq_path: /root/shared-nvme/data/08Haze/LQ_train
+    gt_path: /root/shared-nvme/data/08Haze/GT
     prompt: "a high quality clear image without haze, high contrast, sharp details"
 
-  - name: Train_Denoise
-    deg_type: noise
-    lq_path: /path/to/denoise/LQ_train
-    gt_path: /path/to/denoise/GT
-    prompt: "a high quality clean image without noise, sharp details"
+  - name: Train_Lowlight
+    deg_type: lowlight
+    lq_path: /root/shared-nvme/data/14Lowlight/LQ_train
+    gt_path: /root/shared-nvme/data/14Lowlight/GT
+    prompt: "a high quality well-lit image with natural brightness, visible details"
 
 test:
-  - name: Test_Derain
+  - name: Test_Rain
     deg_type: rain
-    lq_path: /path/to/derain/LQ_val
-    gt_path: /path/to/derain/GT
+    lq_path: /root/shared-nvme/data/10Rain/LQ_val
+    gt_path: /root/shared-nvme/data/10Rain/GT
     prompt: "a high quality clean image without rain streaks, clear visibility"
 
-  - name: Test_Dehaze
+  - name: Test_Haze
     deg_type: haze
-    lq_path: /path/to/dehaze/LQ_val
-    gt_path: /path/to/dehaze/GT
+    lq_path: /root/shared-nvme/data/08Haze/LQ_val
+    gt_path: /root/shared-nvme/data/08Haze/GT
     prompt: "a high quality clear image without haze, high contrast, sharp details"
 
-  - name: Test_Denoise
-    deg_type: noise
-    lq_path: /path/to/denoise/LQ_val
-    gt_path: /path/to/denoise/GT
-    prompt: "a high quality clean image without noise, sharp details"
+  - name: Test_Lowlight
+    deg_type: lowlight
+    lq_path: /root/shared-nvme/data/14Lowlight/LQ_val
+    gt_path: /root/shared-nvme/data/14Lowlight/GT
+    prompt: "a high quality well-lit image with natural brightness, visible details"

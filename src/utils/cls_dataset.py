@@ -14,7 +14,7 @@ import torchvision.transforms.functional as TF
 _IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff'}
 
 # Degradation type → label index.  Order must match num_deg_types used in training.
-DEG_TYPES = ["rain", "haze", "noise"]
+DEG_TYPES = ["rain", "haze", "lowlight"]
 
 
 def _scan_dir(directory):
