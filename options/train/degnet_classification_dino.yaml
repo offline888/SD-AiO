@@ -1,0 +1,129 @@
+name: DegNet_DINO_Classification
+seed: 42
+experiments_dir: /home/yhmi/data/experiments
+
+logging:
+  swanlab_project: "Train_FoundIR_MultiLabel_DegNetDINO"
+  log_interval: 50
+
+accelerator:
+  mixed_precision: "no"
+  find_unused_parameters: false
+
+data:
+  degradations: ['Clean', 'Haze', 'Rain', 'Lowlight']
+
+  dataloader:
+    train:
+      batch_size: 128
+      num_workers: 4
+      pin_memory: true
+      persistent_workers: true
+      drop_last: false
+      prefetch_factor: 24
+
+    val:
+      batch_size: 1
+      num_workers: 4
+      pin_memory: true
+      persistent_workers: true
+      drop_last: false
+      prefetch_factor: 24
+
+  datasets:
+    TrainDataset1:
+      name: Rain
+      degradation: Rain
+      path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/LQ_train
+      resize: 224
+
+    TrainDataset2:
+      name: Haze
+      degradation: Haze·
+      path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/LQ_train
+      resize: 224
+
+    TrainDataset3:
+      name: Lowlight
+      degradation: Lowlight
+      path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/LQ_train
+      resize: 224
+
+    TrainDataset4:
+      name: Clean
+      degradation: Clean
+      path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
+      resize: 224
+
+    TrainDataset5:
+      name: Lowlight_Haze
+      degradation: [Lowlight, Haze]
+      path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/LQ_train
+      resize: 224
+
+    TrainDataset6:
+      name: Rain_Haze
+      degradation: [Rain, Haze]
+      path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/LQ_train
+      resize: 224
+
+    ValDataset1:
+      name: Rain
+      degradation: Rain
+      path: /home/yhmi/data/Datadir/FoundIR_768/10Rain/LQ_val
+      resize: 224
+
+    ValDataset2:
+      name: Haze
+      degradation: Haze
+      path: /home/yhmi/data/Datadir/FoundIR_768/08Haze/LQ_val
+      resize: 224
+
+    ValDataset3:
+      name: Lowlight
+      degradation: Lowlight
+      path: /home/yhmi/data/Datadir/FoundIR_768/14Lowlight/LQ_val
+      resize: 224
+
+    ValDataset4:
+      name: Clean
+      degradation: Clean
+      path: /home/yhmi/data/Datadir/FoundIR_768/01Blur/GT
+      resize: 224
+
+    ValDataset5:
+      name: Lowlight_Haze
+      degradation: [Lowlight, Haze]
+      path: /home/yhmi/data/Datadir/FoundIR_768/09Lowlight_Haze/LQ_val
+      resize: 224
+
+    ValDataset6:
+      name: Rain_Haze
+      degradation: [Rain, Haze]
+      path: /home/yhmi/data/Datadir/FoundIR_768/13Rain_Haze/LQ_val
+      resize: 224
+
+network:
+  type: DegNet_DINO
+  backbone: /home/yhmi/data/model/dinov2-base
+  feature_dim: 512
+  num_classes: 4
+  freeze_encoder: false
+  patch_size: 14
+  encoder_layer_index: 12
+
+train:
+  num_epochs: 30
+  max_grad_norm: 1.0
+  save_freq: 1
+
+  optim:
+    type: AdamW
+    lr: 1e-4
+    weight_decay: 0.01
+
+  scheduler:
+    eta_min: 1e-6
+
+val:
+  val_freq: 1

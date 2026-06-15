@@ -1,0 +1,127 @@
+name: Flux2_Klein_ImageRestoration_AdaLN
+seed: 42
+
+accelerator:
+  # set accelerator config
+  # if not set, use default config in .cache/huggingface/accelerate
+  gradient_accumulation_steps: 4
+  mixed_precision: bf16
+  log_with : swanlab
+  project_dir : /home/yhmi/data/FLUX2Klein_IR_Finetune
+
+logger:
+  project: Flux2_Klein_ImageRestoration
+  log_interval: 100  
+
+network:
+  model_path: /home/yhmi/data/model/flux.2-klein
+  degradation_classifier_path: /home/yhmi/data/model/best_model.pth
+  dino_type: /home/yhmi/data/model/dinov2-base
+
+  num_classes: 4
+  deg_names: ["Clean", "Haze", "Rain", "Lowlight"]   # order matches dataset class indices
+  offload: false
+  unfreeze_adaln_type: all   # double | single | all
+
+train:
+  num_train_iters: 50001
+  max_grad_norm: 1.0
+  fixed_timestep: 300
+  # resume_exp_dir: Flux2_Klein_ImageRestoration_AdaLN_20260326-214447  # 实验目录名（从 experiments/ 下选择）
+  # resume_from: iter_30000  # checkpoint 文件夹名（如 iter_5000, epoch_003 等）
+
+data:
+  resolution: 512
+  embed_dir: /home/yhmi/data/cached_embeddings
+
+  dataloader:
+    train:
+      batch_size: 4
+      num_workers: 16
+      pin_memory: true
+      persistent_workers: true
+      drop_last: true
+      prefetch_factor: 3
+
+    val:
+      batch_size: 8
+      num_workers: 16
+      pin_memory: true
+      persistent_workers: true
+      drop_last: false
+      prefetch_factor: 2
+
+  datasets:
+    TrainDataset1:
+      lq_path: /home/yhmi/data/patches/10Rain/LQ_train
+      hq_path: /home/yhmi/data/patches/10Rain/GT
+      prompt: "remove rain from this image"
+
+    TrainDataset2:
+      lq_path: /home/yhmi/data/patches/08Haze/LQ_train
+      hq_path: /home/yhmi/data/patches/08Haze/GT
+      prompt: "remove haze from this image"
+
+    TrainDataset3:
+      lq_path: /home/yhmi/data/patches/14Lowlight/LQ_train
+      hq_path: /home/yhmi/data/patches/14Lowlight/GT
+      prompt: "enhance low light in this image"
+
+    TrainDataset4:
+      lq_path: /home/yhmi/data/patches/09Lowlight_Haze/LQ_train
+      hq_path: /home/yhmi/data/patches/09Lowlight_Haze/GT
+      prompt: "enhance low light and remove haze from this image"
+
+    TrainDataset5:
+      lq_path: /home/yhmi/data/patches/13Rain_Haze/LQ_train
+      hq_path: /home/yhmi/data/patches/13Rain_Haze/GT
+      prompt: "remove rain and haze from this image"
+
+    ValDataset1:
+      lq_path: /home/yhmi/data/patches/10Rain/LQ_val
+      hq_path: /home/yhmi/data/patches/10Rain/GT
+      prompt: "remove rain from this image"
+
+    ValDataset2:
+      lq_path: /home/yhmi/data/patches/08Haze/LQ_val
+      hq_path: /home/yhmi/data/patches/08Haze/GT
+      prompt: "remove haze from this image"
+
+    ValDataset3:
+      lq_path: /home/yhmi/data/patches/14Lowlight/LQ_val
+      hq_path: /home/yhmi/data/patches/14Lowlight/GT
+      prompt: "enhance low light in this image"
+
+    ValDataset4:
+      lq_path: /home/yhmi/data/patches/09Lowlight_Haze/LQ_val
+      hq_path: /home/yhmi/data/patches/09Lowlight_Haze/GT
+      prompt: "enhance low light and remove haze from this image"
+
+    ValDataset5:
+      lq_path: /home/yhmi/data/patches/13Rain_Haze/LQ_val
+      hq_path: /home/yhmi/data/patches/13Rain_Haze/GT
+      prompt: "remove rain and haze from this image"
+
+optim:
+  lr: 1e-4
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  epsilon: 1e-8
+
+scheduler:
+  type: "cosine"
+  lr_warmup_steps: 2000
+  lr_num_cycles: 2
+#    lr_end: 1e-6
+
+loss:
+  weighting_scheme: "none"
+
+val:
+  skip_init_val: false
+  val_freq_iters: 10000
+  num_vis_samples: 20
+  guidance_scale: 3.0
+  fixed_val_timestep: 500
+  sample_num: 500
