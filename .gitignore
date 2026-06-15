@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
+output/
+swanlog/
+.aris/
+*.pdf
+*.log
+CLAUDE.md
+实验规划.md
+*.pth
+*.pkl
