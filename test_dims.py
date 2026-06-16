@@ -122,9 +122,12 @@ mock_unet = MockUNet()
 from cond_module import build_condition_module, MODULE_REGISTRY
 for mtype in MODULE_REGISTRY:
     kwargs = dict(embed_dim=256, device="cpu", unet=mock_unet, training=False)
-    if mtype == "deg_cross_attn":
+    if mtype in ("deg_cross_attn", "deg_resblock_attn"):
         kwargs["args"] = SimpleNamespace(num_deg_types=4, dino_type=None,
             degradation_classifier_path=None, freeze_decoder=True)
+    if mtype == "deg_resblock_attn":
+        print(f"  {mtype:20s}  (skipped — needs real ResBlock mock)")
+        continue
     mod = build_condition_module(mtype, **kwargs)
     result = mod.get_modulation(torch.randn(1, 3, 64, 64))
     n_layers = len(getattr(mod, 'sft_layers', getattr(mod, 'hook_blocks', {})))

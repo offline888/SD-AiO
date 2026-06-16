@@ -54,9 +54,9 @@ class CODSRFiLMModule(BaseConditionModule):
         self.embed_dim = embed_dim
         # Shared encoder: pixel_unshuffle'd LQ (192ch @ H/8×W/8) → compact feature
         self.shared_encoder = nn.Sequential(
-            nn.Conv2d(192, 256, 3, padding=1),
+            nn.Conv2d(192, 256, 3, padding=1, bias=False),
             nn.SiLU(),
-            nn.Conv2d(256, embed_dim, 3, padding=1),
+            nn.Conv2d(256, embed_dim, 3, padding=1, bias=False),
             nn.SiLU(),
         )
         self.sft_layers = nn.ModuleDict()
@@ -67,12 +67,12 @@ class CODSRFiLMModule(BaseConditionModule):
         """Per-layer lightweight SFT: shared feature → scale + shift."""
         return nn.ModuleDict({
             "scale": nn.Sequential(
-                nn.Conv2d(self.embed_dim, out_ch, 1), nn.SiLU(),
-                zero_module(nn.Conv2d(out_ch, out_ch, 1)),
+                nn.Conv2d(self.embed_dim, out_ch, 1, bias=False), nn.SiLU(),
+                zero_module(nn.Conv2d(out_ch, out_ch, 1, bias=False)),
             ),
             "shift": nn.Sequential(
-                nn.Conv2d(self.embed_dim, out_ch, 1), nn.SiLU(),
-                zero_module(nn.Conv2d(out_ch, out_ch, 1)),
+                nn.Conv2d(self.embed_dim, out_ch, 1, bias=False), nn.SiLU(),
+                zero_module(nn.Conv2d(out_ch, out_ch, 1, bias=False)),
             ),
         })
 
@@ -103,7 +103,10 @@ class CODSRFiLMModule(BaseConditionModule):
         device = unet.conv_in.weight.device
 
         def register(name, conv):
-            self.sft_layers[name] = self._make_sft_head(conv.out_channels).to(device)
+            out_ch = getattr(conv, 'out_channels', None)
+            if out_ch is None and hasattr(conv, 'base_layer'):
+                out_ch = conv.base_layer.out_channels
+            self.sft_layers[name] = self._make_sft_head(out_ch).to(device)
 
         register("conv_in", unet.conv_in);  self._hook_conv(unet.conv_in, "conv_in")
         for down_idx, block in enumerate(unet.down_blocks):
@@ -132,7 +135,8 @@ class CODSRFiLMModule(BaseConditionModule):
     def get_modulation(self, lq_image, timestep=None):
         # 1. Pixel-unshuffle: (B,3,H,W) → (B,192,H/8,W/8) — lossless spatial→channel
         device = next(self.shared_encoder.parameters()).device
-        lq = lq_image.to(device)
+        dtype = next(self.shared_encoder.parameters()).dtype
+        lq = lq_image.to(device=device, dtype=dtype)
         xl = F.pixel_unshuffle(lq, downscale_factor=8)  # [B, 192, H/8, W/8]
 
         # 2. Shared encoder (once per forward)
@@ -274,10 +278,13 @@ class DegCrossAttnModule(BaseConditionModule):
         return module(feat)
 
     def _register_hook_block(self, name, conv):
+        in_ch = getattr(conv, 'in_channels', None)
+        out_ch = getattr(conv, 'out_channels', None)
+        if in_ch is None and hasattr(conv, 'base_layer'):
+            in_ch = conv.base_layer.in_channels
+            out_ch = conv.base_layer.out_channels
         self.hook_blocks[name] = CrossAttnModulationBlock(
-            feat_in_dim=conv.in_channels,
-            feat_out_dim=conv.out_channels,
-            deg_dim=self.inner_dim,
+            feat_in_dim=in_ch, feat_out_dim=out_ch, deg_dim=self.inner_dim,
         )
 
     def _hook_conv(self, conv, hook_name, module, source_channels=None):
@@ -359,10 +366,163 @@ class DegCrossAttnModule(BaseConditionModule):
 #  Registry & builder
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+#  Design 1a-v3 — ResBlock-internal CrossAttn (StableSR-aligned)
+#   F_Deg → 8 semantic tokens → K,V
+#   h₂ (GroupNorm'd) → Q  (no projection)
+#   CrossAttn → γ,β → h₂ * (1+γ) + β  (modulation, NOT replacement)
+# ═══════════════════════════════════════════════════════════════
+
+class TokenGenerator(nn.Module):
+    """F_Deg (B,768) → N semantic tokens (B,N,token_dim)"""
+
+    def __init__(self, deg_dim=768, n_tokens=8, token_dim=64):
+        super().__init__()
+        self.n_tokens = n_tokens
+        self.token_dim = token_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(deg_dim, 512),
+            nn.GELU(),
+            nn.Linear(512, n_tokens * token_dim),
+        )
+
+    def forward(self, deg_feat):
+        B = deg_feat.shape[0]
+        t = self.mlp(deg_feat)
+        return t.view(B, self.n_tokens, self.token_dim)
+
+
+class ResBlockCrossAttnBlock(nn.Module):
+    """Per-ResBlock: pre_norm + CrossAttn(Q=h₂, K/V=tokens) → γ,β"""
+
+    def __init__(self, channels, n_tokens=8, token_dim=64):
+        super().__init__()
+        self.pre_norm = nn.GroupNorm(32, channels)
+        self.k_proj = nn.Linear(token_dim, channels)
+        self.v_proj = nn.Linear(token_dim, channels)
+        self.attn_norm = nn.LayerNorm(channels)
+        self.scale_conv = zero_module(nn.Conv2d(channels, channels, 1))
+        self.shift_conv = zero_module(nn.Conv2d(channels, channels, 1))
+
+    def set_tokens(self, tokens):
+        self._K = self.k_proj(tokens)   # (B, N, C)
+        self._V = self.v_proj(tokens)   # (B, N, C)
+
+    def forward(self, h2):
+        B, C, H, W = h2.shape
+        h2_norm = self.pre_norm(h2)                      # 对齐 StableSR
+        Q = h2_norm.reshape(B, C, H * W).transpose(1, 2)  # (B, HW, C)
+
+        attn = (Q @ self._K.transpose(-2, -1)) * (C ** -0.5)
+        attn = attn.softmax(dim=-1)                       # (B, HW, N)
+        out = attn @ self._V                              # (B, HW, C)
+        out = self.attn_norm(out + Q)                     # 残差
+        out = out.transpose(1, 2).reshape(B, C, H, W)    # (B, C, H, W)
+
+        gamma = self.scale_conv(out)   # zero_init → ≈0
+        beta  = self.shift_conv(out)   # zero_init → ≈0
+        return h2 * (1 + gamma) + beta  # 调制，非替换
+
+
+class ResBlockAttnModule(BaseConditionModule):
+    """1a-v3: hooks ResBlock forward to inject CrossAttn inside."""
+
+    def __init__(self, inner_dim=768, token_dim=64, n_tokens=8, args=None, **kwargs):
+        super().__init__()
+        self.inner_dim = inner_dim
+        self._deg_extractor = None
+        self._args = args
+        self.token_generator = TokenGenerator(inner_dim, n_tokens, token_dim)
+        self.mod_blocks = nn.ModuleDict()
+        self._hooked = False
+
+    def build_deg_extractor(self, device):
+        if self._deg_extractor is not None:
+            return
+        self._deg_extractor = DegFeatExtractor(
+            inner_dim=self.inner_dim,
+            num_deg_types=self._args.num_deg_types,
+            weight_dtype=torch.float32,
+            args=self._args,
+            deg_embedding=None,
+            device=device,
+        )
+        self._deg_extractor.deg_classifier._freeze_encoder()
+        if getattr(self._args, "freeze_decoder", True):
+            self._deg_extractor.deg_classifier.decoder.requires_grad_(False)
+
+    def setup(self, unet):
+        if self._hooked:
+            return
+        self._hooked = True
+
+        def register(name, resblock, channels):
+            # Resolve channels from out_layers' first Conv's in_channels
+            # out_layers = [GroupNorm, SiLU, Dropout, Conv]
+            gn = resblock.out_layers[0]
+            c = gn.num_channels if hasattr(gn, 'num_channels') else gn.num_groups
+            # Actually gn.num_channels is what we need
+            self.mod_blocks[name] = ResBlockCrossAttnBlock(
+                channels=gn.num_channels,
+            ).to(next(resblock.parameters()).device)
+            self._hook_resblock(resblock, name)
+
+        # Enumerate all ResBlocks
+        for di, block in enumerate(unet.down_blocks):
+            for ri, resnet in enumerate(block.resnets):
+                register(f"down_{di}_res_{ri}", resnet, None)
+
+        for ri, resnet in enumerate(getattr(unet.mid_block, 'resnets', [])):
+            register(f"mid_res_{ri}", resnet, None)
+
+        for ui, block in enumerate(unet.up_blocks):
+            for ri, resnet in enumerate(block.resnets):
+                register(f"up_{ui}_res_{ri}", resnet, None)
+
+    def _hook_resblock(self, resblock, name):
+        mod_block = self.mod_blocks[name]
+        orig_forward = resblock.forward
+
+        def hooked_forward(x, emb):
+            # SD 2.1 ResBlock forward:
+            #   h = in_layers(x)           → h₁
+            #   h = h + emb_layers(emb)    → h₂  ← 我们在这里
+            #   h = out_layers(h)          → h₃
+            #   return skip(x) + h
+
+            # Step 1: in_layers + emb → h₂
+            h = resblock.in_layers(x)
+            h = h + resblock.emb_layers(emb)
+
+            # Step 2: our modulation on h₂
+            h = mod_block(h)
+
+            # Step 3: continue with out_layers + skip
+            h = resblock.out_layers(h)
+            return resblock.skip_connection(x) + h
+
+        resblock.forward = hooked_forward
+
+    def get_modulation(self, lq_image, timestep=None):
+        self.build_deg_extractor(lq_image.device)
+        probs = self._deg_extractor.get_probs(lq_image)
+        deg_feat = self._deg_extractor.embed_probs(probs, lq_image.device)
+        tokens = self.token_generator(deg_feat)  # (B, 8, 64)
+
+        for block in self.mod_blocks.values():
+            block.set_tokens(tokens)
+
+        return None, None
+
+    def forward(self, lq_image):
+        return self.get_modulation(lq_image)
+
+
 MODULE_REGISTRY = {
     "none": IdentityConditionModule,
     "codsr_lqfm": CODSRFiLMModule,
     "deg_cross_attn": DegCrossAttnModule,
+    "deg_resblock_attn": ResBlockAttnModule,
 }
 
 
