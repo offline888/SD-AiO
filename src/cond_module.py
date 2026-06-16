@@ -456,52 +456,54 @@ class ResBlockAttnModule(BaseConditionModule):
             return
         self._hooked = True
 
-        def register(name, resblock, channels):
-            # Resolve channels from out_layers' first Conv's in_channels
-            # out_layers = [GroupNorm, SiLU, Dropout, Conv]
-            gn = resblock.out_layers[0]
-            c = gn.num_channels if hasattr(gn, 'num_channels') else gn.num_groups
-            # Actually gn.num_channels is what we need
+        def register(name, resnet):
+            # SD 2.1 ResnetBlock2D: norm2.num_channels gives the feature channels
+            c = resnet.norm2.num_channels
             self.mod_blocks[name] = ResBlockCrossAttnBlock(
-                channels=gn.num_channels,
-            ).to(next(resblock.parameters()).device)
-            self._hook_resblock(resblock, name)
+                channels=c,
+            ).to(next(resnet.parameters()).device)
+            self._hook_resblock(resnet, name)
 
-        # Enumerate all ResBlocks
         for di, block in enumerate(unet.down_blocks):
             for ri, resnet in enumerate(block.resnets):
-                register(f"down_{di}_res_{ri}", resnet, None)
+                register(f"down_{di}_res_{ri}", resnet)
 
         for ri, resnet in enumerate(getattr(unet.mid_block, 'resnets', [])):
-            register(f"mid_res_{ri}", resnet, None)
+            register(f"mid_res_{ri}", resnet)
 
         for ui, block in enumerate(unet.up_blocks):
             for ri, resnet in enumerate(block.resnets):
-                register(f"up_{ui}_res_{ri}", resnet, None)
+                register(f"up_{ui}_res_{ri}", resnet)
 
-    def _hook_resblock(self, resblock, name):
+    def _hook_resblock(self, resnet, name):
+        """Hook diffusers ResnetBlock2D.forward() at h₂ (after conv1+temb, before norm2)."""
         mod_block = self.mod_blocks[name]
-        orig_forward = resblock.forward
+        orig_forward = resnet.forward
 
-        def hooked_forward(x, emb):
-            # SD 2.1 ResBlock forward:
-            #   h = in_layers(x)           → h₁
-            #   h = h + emb_layers(emb)    → h₂  ← 我们在这里
-            #   h = out_layers(h)          → h₃
-            #   return skip(x) + h
+        def hooked_forward(input_tensor, temb):
+            # ── Part 1: norm1 → silu → conv1 → +temb → h₂ ──
+            h = input_tensor
+            h = resnet.norm1(h)
+            h = resnet.nonlinearity(h)
+            h = resnet.conv1(h)
+            if temb is not None:
+                temb_proj = resnet.time_emb_proj(resnet.nonlinearity(temb))[:, :, None, None]
+                h = h + temb_proj
 
-            # Step 1: in_layers + emb → h₂
-            h = resblock.in_layers(x)
-            h = h + resblock.emb_layers(emb)
+            # ── Part 2: our CrossAttn modulation on h₂ ──
+            h = mod_block(h)   # h₂ × (1+γ) + β
 
-            # Step 2: our modulation on h₂
-            h = mod_block(h)
+            # ── Part 3: norm2 → silu → dropout → conv2 → +skip ──
+            h = resnet.norm2(h)
+            h = resnet.nonlinearity(h)
+            h = resnet.dropout(h)
+            h = resnet.conv2(h)
 
-            # Step 3: continue with out_layers + skip
-            h = resblock.out_layers(h)
-            return resblock.skip_connection(x) + h
+            if resnet.conv_shortcut is not None:
+                input_tensor = resnet.conv_shortcut(input_tensor)
+            return input_tensor + h
 
-        resblock.forward = hooked_forward
+        resnet.forward = hooked_forward
 
     def get_modulation(self, lq_image, timestep=None):
         self.build_deg_extractor(lq_image.device)
