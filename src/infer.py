@@ -9,9 +9,8 @@ from omegaconf import OmegaConf
 from torchvision import transforms
 
 from model import SDSingleStepRestoration
-from utils.text_cache import TextEmbeddingCache
+from utils.text_cache import TextEmbeddingContainer
 from utils.image_utils import imread, img2tensor
-from utils.wavelet_color import wavelet_color_fix, adain_color_fix
 from cond_module import build_condition_module
 
 def main():
@@ -27,11 +26,9 @@ def main():
     parser.add_argument("--lora_rank_unet", type=int, default=32)
     parser.add_argument("--lora_rank_vae", type=int, default=16)
     parser.add_argument("--num_inference_steps", type=int, default=1)
-    parser.add_argument("--condition_type", type=str, default="deg_cross_attn")
+    parser.add_argument("--condition_type", type=str, default="deg-aware")
     parser.add_argument("--condition_embed_dim", type=int, default=256)
     parser.add_argument("--timestep", type=int, default=999)
-    parser.add_argument("--align_method", default="wavelet",
-                        choices=["wavelet", "adain", "none"])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--enable_vae_tile", action="store_true")
     parser.add_argument("--vae_tile_size", type=int, default=512)
@@ -55,13 +52,14 @@ def main():
         merge_lora=args.merge_lora,
     ).to(device)
     model.load_checkpoint(args.model_path)
-    model.set_eval()
+    model.unet.eval()
+    model.vae.eval()
 
-    text_cache = TextEmbeddingCache(model.text_encoder, model.tokenizer, device)
+    text_cache = TextEmbeddingContainer(model.text_encoder, model.tokenizer, device)
     all_tasks = OmegaConf.to_container(task_cfg.train, resolve=True) + \
                 OmegaConf.to_container(task_cfg.test, resolve=True)
     for task in all_tasks:
-        text_cache.add_task(task['name'], task['prompt'])
+        text_cache.add_embedding(task['name'], task['prompt'])
     if args.task not in text_cache:
         raise ValueError(f"Task '{args.task}' not in config. Available: {text_cache.task_names}")
 
@@ -70,7 +68,7 @@ def main():
         device, model.unet, training=False,
         args=args)
     if args.cond_module_path is not None:
-        cond_module.load_state_dict(torch.load(args.cond_module_path, map_location=device))
+        cond_module.load_state_dict(torch.load(args.cond_module_path, map_location=device), strict=False)
 
     input_path = Path(args.input)
     lr_paths = [input_path] if input_path.is_file() else sorted(
@@ -98,13 +96,6 @@ def main():
 
         pred = (pred * 0.5 + 0.5).clamp(0, 1)
         pred_pil = transforms.ToPILImage()(pred[0].cpu())
-
-        if args.align_method == "wavelet":
-            lq_pil = transforms.ToPILImage()(im_tensor[0].cpu())
-            pred_pil = wavelet_color_fix(pred_pil, lq_pil)
-        elif args.align_method == "adain":
-            lq_pil = transforms.ToPILImage()(im_tensor[0].cpu())
-            pred_pil = adain_color_fix(pred_pil, lq_pil)
 
         out_path = os.path.join(args.output_dir, f"{lr_path.stem}_restored.png")
         pred_pil.save(out_path)

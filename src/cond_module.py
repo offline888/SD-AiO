@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from typing import Optional, Literal
+from diffusers.models.resnet import ResnetBlock2D
+import torchvision.models as models
 from degnet import DegFeatExtractor
 
 
@@ -11,534 +13,303 @@ def zero_module(module):
     return module
 
 class BaseConditionModule(nn.Module):
-    def setup(self, unet):
+    def setup(self, network: nn.Module):
         pass
-
     def get_modulation(self, lq_image, timestep=None):
-        raise NotImplementedError
-
+        return None, None
     def forward(self, lq_image):
-        raise NotImplementedError
-
+        return self.get_modulation(lq_image)
 
 class IdentityConditionModule(BaseConditionModule):
     def __init__(self, **kwargs):
         super().__init__()
 
-    def get_modulation(self, lq_image, timestep=None):
-        return None, None
 
-    def forward(self, lq_image):
-        return None, None
+# Adapted from StableSR (https://github.com/IceClear/StableSR)
+class SPADE(nn.Module):
+    def __init__(self, 
+                 output_channels: int,
+                 cond_input_channels: int,
+                 kernel_size: int = 3 , 
+                 norm_type: Optional[Literal["instance", "batch", "layer", "group"]] = "group"):
+        
+        super().__init__() 
 
-
-# ═══════════════════════════════════════════════════════════════
-#  SFT Layer
-# ═══════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════
-#  Design 1b — CODSR LQFM (LQ-guided Feature Modulation)
-#   LQ → pixel_unshuffle → shared encoder → per-layer SFT → γ,β
-#   Time-aware: λ_t = √ᾱ_t / √(1-ᾱ_t) scales modulation strength
-#   F' = F × (1 + λ_t · γ) + λ_t · β
-# ═══════════════════════════════════════════════════════════════
-
-class CODSRFiLMModule(BaseConditionModule):
-    """
-    CODSR-style full-layer modulation with pixel-unshuffle fidelity preservation.
-    Shared encoder runs once per forward; per-layer SFT heads are lightweight.
-    """
-
-    def __init__(self, embed_dim=128, **kwargs):
-        super().__init__()
-        self.embed_dim = embed_dim
-        # Shared encoder: pixel_unshuffle'd LQ (192ch @ H/8×W/8) → compact feature
-        self.shared_encoder = nn.Sequential(
-            nn.Conv2d(192, 256, 3, padding=1, bias=False),
-            nn.SiLU(),
-            nn.Conv2d(256, embed_dim, 3, padding=1, bias=False),
-            nn.SiLU(),
-        )
-        self.sft_layers = nn.ModuleDict()
-        self._convs = {}
-        self._hooked = False
-
-    def _make_sft_head(self, out_ch):
-        """Per-layer lightweight SFT: shared feature → scale + shift."""
-        return nn.ModuleDict({
-            "scale": nn.Sequential(
-                nn.Conv2d(self.embed_dim, out_ch, 1, bias=False), nn.SiLU(),
-                zero_module(nn.Conv2d(out_ch, out_ch, 1, bias=False)),
-            ),
-            "shift": nn.Sequential(
-                nn.Conv2d(self.embed_dim, out_ch, 1, bias=False), nn.SiLU(),
-                zero_module(nn.Conv2d(out_ch, out_ch, 1, bias=False)),
-            ),
-        })
-
-    def _hook_conv(self, conv, hook_name):
-        self._convs[hook_name] = conv
-        orig = conv.forward
-
-        def hooked(x):
-            out = orig(x)
-            scale = getattr(conv, "_sft_scale", None)
-            if scale is not None:
-                shift = conv._sft_shift
-                if scale.shape[2:] != out.shape[2:]:
-                    scale = F.interpolate(scale, size=out.shape[2:], mode="bilinear", align_corners=False)
-                    shift = F.interpolate(shift, size=out.shape[2:], mode="bilinear", align_corners=False)
-                out = out * (1 + scale) + shift
-                conv._sft_scale = None
-                conv._sft_shift = None
-            return out
-
-        conv.forward = hooked
-
-    def setup(self, unet):
-        if self._hooked:
-            return
-        self._hooked = True
-
-        device = unet.conv_in.weight.device
-
-        def register(name, conv):
-            out_ch = getattr(conv, 'out_channels', None)
-            if out_ch is None and hasattr(conv, 'base_layer'):
-                out_ch = conv.base_layer.out_channels
-            self.sft_layers[name] = self._make_sft_head(out_ch).to(device)
-
-        register("conv_in", unet.conv_in);  self._hook_conv(unet.conv_in, "conv_in")
-        for down_idx, block in enumerate(unet.down_blocks):
-            for res_idx, resnet in enumerate(block.resnets):
-                conv = getattr(resnet, "conv2", None)
-                if conv is not None:
-                    n = f"down_{down_idx}_res_{res_idx}"; register(n, conv); self._hook_conv(conv, n)
-            for ds_idx, ds in enumerate(getattr(block, "downsamplers", []) or []):
-                conv = getattr(ds, "conv", None)
-                if conv is not None:
-                    n = f"down_{down_idx}_ds_{ds_idx}"; register(n, conv); self._hook_conv(conv, n)
-        for res_idx, resnet in enumerate(getattr(unet.mid_block, "resnets", [])):
-            conv = getattr(resnet, "conv2", None)
-            if conv is not None:
-                n = f"mid_res_{res_idx}"; register(n, conv); self._hook_conv(conv, n)
-        for up_idx, block in enumerate(unet.up_blocks):
-            for res_idx, resnet in enumerate(block.resnets):
-                conv = getattr(resnet, "conv2", None)
-                if conv is not None:
-                    n = f"up_{up_idx}_res_{res_idx}"; register(n, conv); self._hook_conv(conv, n)
-            for us_idx, us in enumerate(getattr(block, "upsamplers", []) or []):
-                conv = getattr(us, "conv", None)
-                if conv is not None:
-                    n = f"up_{up_idx}_us_{us_idx}"; register(n, conv); self._hook_conv(conv, n)
-
-    def get_modulation(self, lq_image, timestep=None):
-        # 1. Pixel-unshuffle: (B,3,H,W) → (B,192,H/8,W/8) — lossless spatial→channel
-        device = next(self.shared_encoder.parameters()).device
-        dtype = next(self.shared_encoder.parameters()).dtype
-        lq = lq_image.to(device=device, dtype=dtype)
-        xl = F.pixel_unshuffle(lq, downscale_factor=8)  # [B, 192, H/8, W/8]
-
-        # 2. Shared encoder (once per forward)
-        feat = self.shared_encoder(xl)  # [B, embed_dim, H/8, W/8]
-
-        # 3. Time-aware λ_t = √ᾱ / √(1-ᾱ)
-        #    Pre-multiplied into scale/shift so hooks stay unchanged
-        if timestep is not None and timestep > 0:
-            # DDPM ᾱ_t: rough approximation from timestep
-            # ᾱ_t ≈ 1 - t/1000 (linear approximation for SD scheduler)
-            alpha_bar = max(1.0 - timestep / 1000.0, 0.001)
-            lam = (alpha_bar ** 0.5) / max((1 - alpha_bar) ** 0.5, 0.02)
-            lam = min(lam, 10.0)  # cap to avoid exploding at small t
+        if norm_type == "group":
+            self.norm = nn.GroupNorm(num_groups=32, num_channels=output_channels)
+        elif norm_type == "batch":
+            self.norm = nn.BatchNorm2d(output_channels)
+        elif norm_type == "layer":
+            # layer norm is a special case of group norm with 1 group
+            self.norm = nn.GroupNorm(num_groups=1, num_channels=output_channels) 
+        elif norm_type == "instance":
+            self.norm = nn.InstanceNorm2d(output_channels)
         else:
-            lam = 1.0
+            raise ValueError(f"Invalid norm type: {norm_type}")
 
-        # 4. Per-layer SFT heads
-        for name, sft_head in self.sft_layers.items():
-            conv = self._convs[name]
-            # Interpolate shared feat to match conv's expected spatial resolution
-            # (the hook will interpolate again if needed, but we give it at H/8×W/8)
-            scale = sft_head["scale"](feat)  # [B, out_ch, H/8, W/8]
-            shift = sft_head["shift"](feat)  # [B, out_ch, H/8, W/8]
-            conv._sft_scale = (lam * scale).to(device=conv.weight.device)
-            conv._sft_shift = (lam * shift).to(device=conv.weight.device)
-        return None, None
+        pad = kernel_size // 2
+        self.mlp_shared = nn.Sequential(nn.Conv2d(cond_input_channels, 128, kernel_size, padding=pad), nn.ReLU())
+        self.mlp_gamma = nn.Conv2d(128, output_channels, kernel_size, padding=pad)
+        self.mlp_beta = nn.Conv2d(128, output_channels, kernel_size, padding=pad)
+    def forward(self, x: torch.Tensor, cond_feat: torch.Tensor):
+        # x shape: (B, C, H, W)
+        assert cond_feat.shape[2:] == x.shape[2:], "Condition feature must have the same spatial resolution as the input"
+        
+        normalized_x = self.norm(x)
 
-    def forward(self, lq_image):
-        return self.get_modulation(lq_image)
+        h = self.mlp_shared(cond_feat)
+        gamma = self.mlp_gamma(h)
+        beta = self.mlp_beta(h)
 
+        out = normalized_x * (1 + gamma) + beta
+        return out
 
-# ═══════════════════════════════════════════════════════════════
-#  Cross-Attention Block
-# ═══════════════════════════════════════════════════════════════
-
-class CrossAttnModulationBlock(nn.Module):
-    def __init__(self, feat_in_dim, feat_out_dim, deg_dim):
+class SPADEWrapper(nn.Module):
+    def __init__(self, target_module: nn.Conv2d, condition_channels: int):
         super().__init__()
-        self.feat_in_dim = feat_in_dim
-        self.feat_out_dim = feat_out_dim
+        self.target_module = target_module
 
-        self.q_proj = nn.Conv2d(feat_in_dim, feat_out_dim, kernel_size=1)
-        self.k_proj = nn.Linear(deg_dim, feat_out_dim)
-        self.v_proj = nn.Linear(deg_dim, feat_out_dim)
-        self.scale_proj = zero_module(nn.Linear(feat_out_dim, feat_out_dim))
-        self.shift_proj = zero_module(nn.Linear(feat_out_dim, feat_out_dim))
-        self.norm = nn.LayerNorm(feat_out_dim)
+        self.spade = SPADE(
+            output_channels=target_module.out_channels,
+            cond_input_channels=condition_channels,
+            kernel_size=3,
+            norm_type="group"
+        )
 
-        self._deg_k = None
-        self._deg_v = None
+        self.current_cond_feat = None
 
-    def set_deg(self, deg_feat):
-        proj_weight = self.k_proj.weight
-        deg_feat = deg_feat.to(device=proj_weight.device, dtype=proj_weight.dtype)
-        self._deg_k = self.k_proj(deg_feat)
-        self._deg_v = self.v_proj(deg_feat)
+    @property
+    def weight(self): return self.target_module.weight
+    @property
+    def bias(self): return self.target_module.bias
+    @property
+    def kernel_size(self): return self.target_module.kernel_size
+    @property
+    def stride(self): return self.target_module.stride
+    @property
+    def padding(self): return self.target_module.padding
+    @property
+    def dilation(self): return self.target_module.dilation
+    @property
+    def groups(self): return self.target_module.groups
+    @property
+    def out_channels(self): return self.target_module.out_channels
+    @property
+    def in_channels(self): return self.target_module.in_channels
 
-    def forward(self, feat):
-        q_weight = self.q_proj.weight
-        feat = feat.to(device=q_weight.device, dtype=q_weight.dtype)
+    def forward(self, x):
+        hidden_states = self.target_module(x)
 
-        b, _, h, w = feat.shape
-        q = self.q_proj(feat).permute(0, 2, 3, 1).reshape(b, h * w, self.feat_out_dim)
-        k = self._deg_k.unsqueeze(1)
-        v = self._deg_v.unsqueeze(1)
+        if self.current_cond_feat is None:
+            raise ValueError("Condition feature is None!!")
 
-        attn = torch.matmul(q, k.transpose(-2, -1)) * (self.feat_out_dim ** -0.5)
-        attn = attn.softmax(dim=-1)
-        out = torch.matmul(attn, v).mean(dim=1)
-        out = self.norm(out + q.mean(dim=1))
+        cond_feat = self.current_cond_feat.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        assert cond_feat.shape[2:] == hidden_states.shape[2:], "Condition feature must have the same spatial resolution as the input"
 
-        scale = self.scale_proj(out).view(b, self.feat_out_dim, 1, 1)
-        shift = self.shift_proj(out).view(b, self.feat_out_dim, 1, 1)
-        return scale, shift
+        hidden_states = self.spade(hidden_states, cond_feat)
+        self.current_cond_feat = None
 
+        return hidden_states
 
-# ═══════════════════════════════════════════════════════════════
-#  Design 1a — Degradation Cross-Attention (feature pyramid + CrossAttn)
-# ═══════════════════════════════════════════════════════════════
+    @classmethod
+    def inject(cls, unet, condition_channels):
+        wrappers = []
+        for _, module in unet.named_modules():
+            if isinstance(module, ResnetBlock2D):
+                wrapper = cls(module.conv2, condition_channels)
+                module.conv2 = wrapper
+                wrappers.append(wrapper)
+        return wrappers
 
-class DegCrossAttnModule(BaseConditionModule):
-    def __init__(self, inner_dim=768, kv_dim=128, args=None, **kwargs):
+class MultiScaleExtractor(nn.Module):
+    C320, C640, C1280 = 320, 640, 1280
+
+    def __init__(self, backbone_type: Literal["simple-conv", "resnet18", "convnext_tiny"] = "resnet18"):
         super().__init__()
-        self.inner_dim = inner_dim
-        self.kv_dim = kv_dim
-        self._deg_extractor = None
-        self._args = args
+        self.backbone_type = backbone_type.lower()
+        
+        self.ch_320 = 320
+        self.ch_640 = 640
+        self.ch_1280 = 1280
+        
+        if self.backbone_type == "simple-conv":
+
+            self.conv_in = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1), nn.SiLU(),
+                nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1), nn.SiLU(),
+                nn.Conv2d(128, self.ch_320, kernel_size=4, stride=2, padding=1), nn.SiLU()
+            )
+            self.down_C640 = nn.Sequential(nn.Conv2d(self.ch_320, self.ch_640, 4, stride=2, padding=1), nn.SiLU())
+            self.down_C1280_D = nn.Sequential(nn.Conv2d(self.ch_640, self.ch_1280, 4, stride=2, padding=1), nn.SiLU())
+            self.down_C1280_M = nn.Sequential(nn.Conv2d(self.ch_1280, self.ch_1280, 4, stride=2, padding=1), nn.SiLU())
+
+        elif self.backbone_type == "resnet18":
+            resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+            self.stem = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool, resnet.layer1)
+            self.layer_320_raw, self.layer_640_raw, self.layer_1280_raw = resnet.layer2, resnet.layer3, resnet.layer4
+            self.proj_320 = nn.Conv2d(128, self.C320, 1)
+            self.proj_640 = nn.Conv2d(256, self.C640, 1)
+            self.proj_1280 = nn.Conv2d(512, self.C1280, 1)
+            self.down_C1280_M = nn.Sequential(nn.Conv2d(self.C1280, self.C1280, 3, 2, 1), nn.SiLU())
+        elif self.backbone_type == "convnext_tiny":
+            features = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1).features
+            self.stem = nn.Sequential(features[0], features[1])
+            self.layer_320_raw = nn.Sequential(features[2], features[3])
+            self.layer_640_raw = nn.Sequential(features[4], features[5])
+            self.layer_1280_raw = nn.Sequential(features[6], features[7])
+            self.proj_320 = nn.Conv2d(192, self.C320, 1)
+            self.proj_640 = nn.Conv2d(384, self.C640, 1)
+            self.proj_1280 = nn.Conv2d(768, self.C1280, 1)
+            self.down_C1280_M = nn.Sequential(nn.Conv2d(self.C1280, self.C1280, 3, 2, 1), nn.GELU())
+        else:
+            raise ValueError(f"Unsupported backbone: {backbone_type}")
+
+    def forward(self, x):
+        if self.backbone_type == "simple-conv":
+            f_320 = self.conv_in(x)
+            f_640 = self.down_C640(f_320)
+            f_1280_D = self.down_C1280_D(f_640)
+            f_1280_M = self.down_C1280_M(f_1280_D)
+        else:
+            h = self.stem(x)
+            h_320 = self.layer_320_raw(h)
+            h_640 = self.layer_640_raw(h_320)
+            h_1280 = self.layer_1280_raw(h_640)
+            f_320 = self.proj_320(h_320)
+            f_640 = self.proj_640(h_640)
+            f_1280_D = self.proj_1280(h_1280)
+            f_1280_M = self.down_C1280_M(f_1280_D)
+        return {"C320": f_320, "C640": f_640, "C1280_Down": f_1280_D, "C1280_Mid": f_1280_M}
+
+
+class SimpleModule(BaseConditionModule):
+    DOWN_KEYS = {0: "C320", 1: "C640", 2: "C1280_Down", 3: "C1280_Mid"}
+    UP_KEYS = {0: "C1280_Mid", 1: "C1280_Down", 2: "C640", 3: "C320"}
+
+    def __init__(self, backbone_type="resnet18", **kwargs):
+        super().__init__()
+        self.extractor = MultiScaleExtractor(backbone_type=backbone_type)
+        self._scale_groups = {k: [] for k in self.DOWN_KEYS.values()}
+        self.spade_wrappers = nn.ModuleList()
         self._hooked = False
-        self.hook_blocks = nn.ModuleDict()
 
-        self.feature_pyramid = nn.ModuleDict({
-            "4": nn.Sequential(
-                nn.Conv2d(3, 32, 3, stride=1, padding=1), nn.SiLU(),
-                nn.Conv2d(32, 4, 3, stride=1, padding=1), nn.SiLU(),
-            ),
-            "320": nn.Sequential(
-                nn.Conv2d(3, 64, 3, stride=1, padding=1), nn.SiLU(),
-                nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.SiLU(),
-                nn.Conv2d(128, 320, 3, stride=1, padding=1), nn.SiLU(),
-            ),
-            "640": nn.Sequential(
-                nn.Conv2d(3, 64, 3, stride=1, padding=1), nn.SiLU(),
-                nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.SiLU(),
-                nn.Conv2d(128, 320, 3, stride=2, padding=1), nn.SiLU(),
-                nn.Conv2d(320, 640, 3, stride=1, padding=1), nn.SiLU(),
-            ),
-            "1280": nn.Sequential(
-                nn.Conv2d(3, 64, 3, stride=1, padding=1), nn.SiLU(),
-                nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.SiLU(),
-                nn.Conv2d(128, 320, 3, stride=2, padding=1), nn.SiLU(),
-                nn.Conv2d(320, 640, 3, stride=2, padding=1), nn.SiLU(),
-                nn.Conv2d(640, 1280, 3, stride=1, padding=1), nn.SiLU(),
-            ),
-        })
-
-    def build_deg_extractor(self, device):
-        if self._deg_extractor is not None:
-            return
-        self._deg_extractor = DegFeatExtractor(
-            inner_dim=self.inner_dim,
-            num_deg_types=self._args.num_deg_types,
-            weight_dtype=torch.float32,
-            args=self._args,
-            deg_embedding=None,
-            device=device,
-        )
-        # DegFeatExtractor.__init__ already froze everything via requires_grad_(False).
-        # Optionally unfreeze decoder for fine-tuning:
-        if not getattr(self._args, "freeze_decoder", True):
-            self._deg_extractor.deg_classifier.decoder.requires_grad_(True)
-
-    def _get_pyramid_feature(self, lq_image, channels):
-        key = str(channels)
-        if key not in self.feature_pyramid:
-            raise ValueError(f"Unsupported UNet hook channels: {channels}")
-        module = self.feature_pyramid[key]
-        first_weight = next(module.parameters())
-        feat = lq_image.to(device=first_weight.device, dtype=first_weight.dtype)
-        return module(feat)
-
-    def _register_hook_block(self, name, conv):
-        in_ch = getattr(conv, 'in_channels', None)
-        out_ch = getattr(conv, 'out_channels', None)
-        if in_ch is None and hasattr(conv, 'base_layer'):
-            in_ch = conv.base_layer.in_channels
-            out_ch = conv.base_layer.out_channels
-        self.hook_blocks[name] = CrossAttnModulationBlock(
-            feat_in_dim=in_ch, feat_out_dim=out_ch, deg_dim=self.inner_dim,
-        )
-
-    def _hook_conv(self, conv, hook_name, module, source_channels=None):
-        orig = conv.forward
-
-        def hooked(x):
-            out = orig(x)
-            if getattr(module, "_deg_feat", None) is None:
-                return out
-            fc = conv.in_channels if source_channels is None else source_channels
-            feat = module._get_pyramid_feature(module._current_lq_image, fc)
-            feat = F.interpolate(feat, size=x.shape[2:], mode="bilinear", align_corners=False)
-            scale, shift = module.hook_blocks[hook_name](feat)
-            scale = scale.to(device=out.device, dtype=out.dtype)
-            shift = shift.to(device=out.device, dtype=out.dtype)
-            return out * (1 + scale) + shift
-
-        conv.forward = hooked
+    def clear_cache(self):
+        for wrappers in self._scale_groups.values():
+            for w in wrappers:
+                w.current_cond_feat = None
 
     def setup(self, unet):
         if self._hooked:
             return
         self._hooked = True
 
-        self._register_hook_block("conv_in", unet.conv_in)
-        self._hook_conv(unet.conv_in, "conv_in", self, source_channels=4)
-
-        for down_idx, block in enumerate(unet.down_blocks):
-            for res_idx, resnet in enumerate(block.resnets):
-                conv = getattr(resnet, "conv2", None)
-                if conv is not None:
-                    name = f"down_{down_idx}_res_{res_idx}"
-                    self._register_hook_block(name, conv)
-                    self._hook_conv(conv, name, self)
-            for ds_idx, ds in enumerate(getattr(block, "downsamplers", []) or []):
-                conv = getattr(ds, "conv", None)
-                if conv is not None:
-                    name = f"down_{down_idx}_ds_{ds_idx}"
-                    self._register_hook_block(name, conv)
-                    self._hook_conv(conv, name, self)
-
-        for res_idx, resnet in enumerate(getattr(unet.mid_block, "resnets", [])):
+        def hook_conv2(resnet, channel_key):
             conv = getattr(resnet, "conv2", None)
-            if conv is not None:
-                name = f"mid_res_{res_idx}"
-                self._register_hook_block(name, conv)
-                self._hook_conv(conv, name, self)
+            if conv is None:
+                return
+            out_ch = getattr(conv, "out_channels", None) or conv.base_layer.out_channels
+            wrapper = SPADEWrapper(conv, out_ch)
+            self._scale_groups[channel_key].append(wrapper)
+            self.spade_wrappers.append(wrapper)
+            resnet.conv2 = wrapper
 
-        for up_idx, block in enumerate(unet.up_blocks):
-            for res_idx, resnet in enumerate(block.resnets):
-                conv = getattr(resnet, "conv2", None)
-                if conv is not None:
-                    name = f"up_{up_idx}_res_{res_idx}"
-                    self._register_hook_block(name, conv)
-                    self._hook_conv(conv, name, self)
-            for us_idx, us in enumerate(getattr(block, "upsamplers", []) or []):
-                conv = getattr(us, "conv", None)
-                if conv is not None:
-                    name = f"up_{up_idx}_us_{us_idx}"
-                    self._register_hook_block(name, conv)
-                    self._hook_conv(conv, name, self)
+        for i, block in enumerate(unet.down_blocks):
+            for resnet in block.resnets:
+                hook_conv2(resnet, self.DOWN_KEYS[i])
+        for resnet in getattr(unet.mid_block, "resnets", []):
+            hook_conv2(resnet, "C1280_Mid")
+        for i, block in enumerate(unet.up_blocks):
+            for resnet in block.resnets:
+                hook_conv2(resnet, self.UP_KEYS[i])
 
-    def get_modulation(self, lq_image, timestep=None):
-        self.build_deg_extractor(lq_image.device)
-        probs = self._deg_extractor.get_probs(lq_image)
-        deg_feat = self._deg_extractor.embed_probs(probs, lq_image.device)
-        self._current_lq_image = lq_image
-        self._deg_feat = deg_feat
-        for block in self.hook_blocks.values():
-            block.set_deg(deg_feat)
-        return None, None
-
-    def forward(self, lq_image):
-        self.get_modulation(lq_image)
-        return None, None
-
-
-# ═══════════════════════════════════════════════════════════════
-#  Registry & builder
-# ═══════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════
-#  Design 1a-v3 — ResBlock-internal CrossAttn (StableSR-aligned)
-#   F_Deg → 8 semantic tokens → K,V
-#   h₂ (GroupNorm'd) → Q  (no projection)
-#   CrossAttn → γ,β → h₂ * (1+γ) + β  (modulation, NOT replacement)
-# ═══════════════════════════════════════════════════════════════
-
-class TokenGenerator(nn.Module):
-    """F_Deg (B,768) → N semantic tokens (B,N,token_dim)"""
-
-    def __init__(self, deg_dim=768, n_tokens=8, token_dim=64):
-        super().__init__()
-        self.n_tokens = n_tokens
-        self.token_dim = token_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(deg_dim, 512),
-            nn.GELU(),
-            nn.Linear(512, n_tokens * token_dim),
-        )
-
-    def forward(self, deg_feat):
-        B = deg_feat.shape[0]
-        t = self.mlp(deg_feat)
-        return t.view(B, self.n_tokens, self.token_dim)
-
-
-class ResBlockCrossAttnBlock(nn.Module):
-    """Per-ResBlock: pre_norm + CrossAttn(Q=h₂, K/V=tokens) → γ,β"""
-
-    def __init__(self, channels, n_tokens=8, token_dim=64):
-        super().__init__()
-        self.pre_norm = nn.GroupNorm(32, channels)
-        self.k_proj = nn.Linear(token_dim, channels)
-        self.v_proj = nn.Linear(token_dim, channels)
-        self.attn_norm = nn.LayerNorm(channels)
-        self.scale_conv = zero_module(nn.Conv2d(channels, channels, 1))
-        self.shift_conv = zero_module(nn.Conv2d(channels, channels, 1))
-
-    def set_tokens(self, tokens):
-        self._K = self.k_proj(tokens)   # (B, N, C)
-        self._V = self.v_proj(tokens)   # (B, N, C)
-
-    def forward(self, h2):
-        B, C, H, W = h2.shape
-        h2_norm = self.pre_norm(h2)                      # 对齐 StableSR
-        Q = h2_norm.reshape(B, C, H * W).transpose(1, 2)  # (B, HW, C)
-
-        attn = (Q @ self._K.transpose(-2, -1)) * (C ** -0.5)
-        attn = attn.softmax(dim=-1)                       # (B, HW, N)
-        out = attn @ self._V                              # (B, HW, C)
-        out = self.attn_norm(out + Q)                     # 残差
-        out = out.transpose(1, 2).reshape(B, C, H, W)    # (B, C, H, W)
-
-        gamma = self.scale_conv(out)   # zero_init → ≈0
-        beta  = self.shift_conv(out)   # zero_init → ≈0
-        return h2 * (1 + gamma) + beta  # 调制，非替换
-
-
-class ResBlockAttnModule(BaseConditionModule):
-    """1a-v3: hooks ResBlock forward to inject CrossAttn inside."""
-
-    def __init__(self, inner_dim=768, token_dim=64, n_tokens=8, args=None, **kwargs):
-        super().__init__()
-        self.inner_dim = inner_dim
-        self._deg_extractor = None
-        self._args = args
-        self.token_generator = TokenGenerator(inner_dim, n_tokens, token_dim)
-        self.mod_blocks = nn.ModuleDict()
-        self._hooked = False
-
-    def build_deg_extractor(self, device):
-        if self._deg_extractor is not None:
-            return
-        self._deg_extractor = DegFeatExtractor(
-            inner_dim=self.inner_dim,
-            num_deg_types=self._args.num_deg_types,
-            weight_dtype=torch.float32,
-            args=self._args,
-            deg_embedding=None,
-            device=device,
-        )
-        self._deg_extractor.deg_classifier._freeze_encoder()
-        if getattr(self._args, "freeze_decoder", True):
-            self._deg_extractor.deg_classifier.decoder.requires_grad_(False)
-
-    def setup(self, unet):
-        if self._hooked:
-            return
-        self._hooked = True
-
-        def register(name, resnet):
-            # SD 2.1 ResnetBlock2D: norm2.num_channels gives the feature channels
-            c = resnet.norm2.num_channels
-            self.mod_blocks[name] = ResBlockCrossAttnBlock(
-                channels=c,
-            ).to(next(resnet.parameters()).device)
-            self._hook_resblock(resnet, name)
-
-        for di, block in enumerate(unet.down_blocks):
-            for ri, resnet in enumerate(block.resnets):
-                register(f"down_{di}_res_{ri}", resnet)
-
-        for ri, resnet in enumerate(getattr(unet.mid_block, 'resnets', [])):
-            register(f"mid_res_{ri}", resnet)
-
-        for ui, block in enumerate(unet.up_blocks):
-            for ri, resnet in enumerate(block.resnets):
-                register(f"up_{ui}_res_{ri}", resnet)
-
-    def _hook_resblock(self, resnet, name):
-        """Hook diffusers ResnetBlock2D.forward() at h₂ (after conv1+temb, before norm2)."""
-        mod_block = self.mod_blocks[name]
-        orig_forward = resnet.forward
-
-        def hooked_forward(input_tensor, temb):
-            # ── Part 1: norm1 → silu → conv1 → +temb → h₂ ──
-            h = input_tensor
-            h = resnet.norm1(h)
-            h = resnet.nonlinearity(h)
-            h = resnet.conv1(h)
-            if temb is not None:
-                temb_proj = resnet.time_emb_proj(resnet.nonlinearity(temb))[:, :, None, None]
-                h = h + temb_proj
-
-            # ── Part 2: our CrossAttn modulation on h₂ ──
-            h = mod_block(h)   # h₂ × (1+γ) + β
-
-            # ── Part 3: norm2 → silu → dropout → conv2 → +skip ──
-            h = resnet.norm2(h)
-            h = resnet.nonlinearity(h)
-            h = resnet.dropout(h)
-            h = resnet.conv2(h)
-
-            if resnet.conv_shortcut is not None:
-                input_tensor = resnet.conv_shortcut(input_tensor)
-            return input_tensor + h
-
-        resnet.forward = hooked_forward
+        print(f"[SimpleModule] backbone={self.extractor.backbone_type.upper()} "
+              f"hooks={sum(len(w) for w in self._scale_groups.values())}")
 
     def get_modulation(self, lq_image, timestep=None):
-        self.build_deg_extractor(lq_image.device)
-        probs = self._deg_extractor.get_probs(lq_image)
-        deg_feat = self._deg_extractor.embed_probs(probs, lq_image.device)
-        tokens = self.token_generator(deg_feat)  # (B, 8, 64)
-
-        for block in self.mod_blocks.values():
-            block.set_tokens(tokens)
-
+        device, dtype = next(self.parameters()).device, next(self.parameters()).dtype
+        feats = self.extractor(lq_image.to(device=device, dtype=dtype))
+        for key, wrappers in self._scale_groups.items():
+            for w in wrappers:
+                w.current_cond_feat = feats[key]
         return None, None
 
     def forward(self, lq_image):
         return self.get_modulation(lq_image)
 
+
+class DegTextFusion(nn.Module):
+    """F_Deg → text token → prepend to CLIP text embedding → UNet cross-attention."""
+    def __init__(self, inner_dim=768, text_dim=1024):
+        super().__init__()
+        self.deg_token_proj = nn.Sequential(
+            nn.Linear(inner_dim, text_dim), nn.GELU(),
+            nn.Linear(text_dim, text_dim))
+
+    def forward(self, F_deg, text_embedding):
+        if text_embedding is None:
+            return None
+        deg_token = self.deg_token_proj(F_deg).unsqueeze(1)
+        return torch.cat([deg_token, text_embedding], dim=1)
+
+
+class DegAwareModule(BaseConditionModule):
+    def __init__(self, backbone_type="resnet18", embed_dim=768, inner_dim=768, args=None, **kwargs):
+        super().__init__()
+        self.inner_dim = inner_dim
+        self._args = args
+        self.spatial_extractor = SimpleModule(backbone_type=backbone_type)
+        self.text_fusion = DegTextFusion(inner_dim=inner_dim, text_dim=1024)
+        self.deg_extractor = None
+
+    def build_deg_extractor(self, device):
+        if self.deg_extractor is not None:
+            return
+        if self._args is None:
+            raise ValueError("DegAwareModule requires args for DegFeatExtractor")
+        self.deg_extractor = DegFeatExtractor(
+            inner_dim=self.inner_dim, num_deg_types=self._args.num_deg_types,
+            weight_dtype=torch.float32, args=self._args, deg_embedding=None, device=device)
+        self.deg_extractor.deg_classifier._freeze_encoder()
+        if getattr(self._args, "freeze_decoder", True):
+            self.deg_extractor.deg_classifier.decoder.requires_grad_(False)
+
+    def setup(self, unet):
+        self.spatial_extractor.setup(unet)
+
+    def get_modulation(self, lq_image, text_embedding=None, timestep=None):
+        device, dtype = next(self.parameters()).device, next(self.parameters()).dtype
+
+        # Spatial: backbone → SPADE (no degradation modulation)
+        self.spatial_extractor.get_modulation(lq_image)
+
+        # Text: F_Deg → deg_token → prepend to text_embedding
+        self.build_deg_extractor(lq_image.device)
+        F_deg = self.deg_extractor.get_deg_feat(lq_image).to(device=device, dtype=dtype)
+        text_embedding = self.text_fusion(F_deg, text_embedding)
+
+        return None, text_embedding
+
+    def forward(self, lq_image, text_embedding=None):
+        return self.get_modulation(lq_image, text_embedding)
 
 MODULE_REGISTRY = {
     "none": IdentityConditionModule,
-    "codsr_lqfm": CODSRFiLMModule,
-    "deg_cross_attn": DegCrossAttnModule,
-    "deg_resblock_attn": ResBlockAttnModule,
+    "simple": SimpleModule,
+    "deg-aware": DegAwareModule,
+    # backward-compat alias
+    "deg_aware_sft": DegAwareModule,
 }
 
-
-def build_condition_module(module_type, embed_dim=256, device=None, unet=None, training=True, **kwargs):
+def build_condition_module(module_type, embed_dim=256, device=None, unet=None,
+                           training=False, backbone_type="resnet18", **kwargs):
+    """Default training=False; caller should call .train() explicitly during training."""
     cls = MODULE_REGISTRY.get(module_type)
     if cls is None:
         raise ValueError(f"Unknown: {module_type}. Options: {list(MODULE_REGISTRY)}")
-    module = cls(embed_dim=embed_dim, **kwargs)
+    module = cls(embed_dim=embed_dim, backbone_type=backbone_type, **kwargs)
     if device:
         module = module.to(device)
-    if training:
-        module.train()
-    else:
-        module.eval()
+    module.train() if training else module.eval()
     if unet is not None:
         module.setup(unet)
     return module

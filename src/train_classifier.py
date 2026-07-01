@@ -4,8 +4,8 @@
 import argparse
 import os
 
-import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -13,7 +13,59 @@ from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
 from degnet import DegNet_DINO
-from utils.cls_dataset import ClassificationDataset
+from utils.dataset import ClassificationDataset
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss for imbalanced classification: FL = -(1-p_t)^γ * log(p_t)"""
+    def __init__(self, gamma=2.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(logits, targets, reduction='none')
+        pt = torch.exp(-ce)
+        focal = (1 - pt) ** self.gamma * ce
+        if self.alpha is not None:
+            at = self.alpha[targets]
+            focal = at * focal
+        return focal.mean()
+
+
+def compute_binary_metrics(preds, labels):
+    preds = preds.long()
+    labels = labels.long()
+
+    per_class = []
+    for c in range(labels.shape[1]):
+        pred_c = preds[:, c]
+        label_c = labels[:, c]
+        tp = ((pred_c == 1) & (label_c == 1)).sum().item()
+        fp = ((pred_c == 1) & (label_c == 0)).sum().item()
+        fn = ((pred_c == 0) & (label_c == 1)).sum().item()
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+        per_class.append({
+            'accuracy': (pred_c == label_c).float().mean().item(),
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+        })
+
+    precision_vals = [m['precision'] for m in per_class]
+    recall_vals = [m['recall'] for m in per_class]
+    f1_vals = [m['f1'] for m in per_class]
+
+    return {
+        'accuracy': (preds == labels).float().mean().item(),
+        'exact_match': (preds == labels).all(dim=1).float().mean().item(),
+        'precision': sum(precision_vals) / max(len(precision_vals), 1),
+        'recall': sum(recall_vals) / max(len(recall_vals), 1),
+        'f1': sum(f1_vals) / max(len(f1_vals), 1),
+        'per_class': per_class,
+    }
 
 
 def main():
@@ -36,6 +88,8 @@ def main():
     parser.add_argument("--checkpointing_steps", type=int, default=2000)
     parser.add_argument("--eval_freq", type=int, default=500)
     parser.add_argument("--log_with", type=str, default=None)
+    parser.add_argument("--focal_gamma", type=float, default=2.0,
+                        help="Focal Loss gamma; 0 = plain CrossEntropy")
     args = parser.parse_args()
 
     task_cfg = OmegaConf.load(args.task_config)
@@ -112,8 +166,8 @@ def main():
 
             logits = model(lq)  # [B, C, 2]
             B, C, _ = logits.shape
-            # Reshape to [B*C, 2] for per-degradation 2-way classification
-            loss = F.cross_entropy(logits.view(B * C, 2), labels.view(B * C))
+            loss = FocalLoss(gamma=args.focal_gamma)(
+                logits.view(B * C, 2), labels.view(B * C))
 
             accelerator.backward(loss)
             optimizer.step()
@@ -133,23 +187,42 @@ def main():
                     ckpt_path = os.path.join(args.output_dir, f"classifier_step_{global_step}.pth")
                     torch.save(unwrapped.state_dict(), ckpt_path)
 
-                if global_step % args.eval_freq == 0 and len(val_loader) > 0:
-                    val_accs = []
-                    model.eval()
-                    with torch.no_grad():
-                        for val_batch in val_loader:
-                            val_lq = val_batch['lq'].to(accelerator.device, dtype=weight_dtype)
-                            val_labels = val_batch['label'].to(accelerator.device, dtype=torch.long)
-                            val_logits = model(val_lq)
-                            val_preds = val_logits.argmax(dim=-1)
-                            val_accs.append((val_preds == val_labels).float().mean().item())
-                    val_acc = np.mean(val_accs)
-                    if val_acc > best_val_acc:
-                        best_val_acc = val_acc
+            if global_step % args.eval_freq == 0 and len(val_loader) > 0:
+                model.eval()
+                gathered_preds = []
+                gathered_labels = []
+                with torch.no_grad():
+                    for val_batch in val_loader:
+                        val_lq = val_batch['lq'].to(accelerator.device, dtype=weight_dtype)
+                        val_labels = val_batch['label'].to(accelerator.device, dtype=torch.long)
+                        val_logits = model(val_lq)
+                        val_preds = val_logits.argmax(dim=-1)
+                        gathered_preds.append(accelerator.gather(val_preds))
+                        gathered_labels.append(accelerator.gather(val_labels))
+
+                if accelerator.is_main_process and gathered_preds:
+                    all_preds = torch.cat(gathered_preds, dim=0)
+                    all_labels = torch.cat(gathered_labels, dim=0)
+                    metrics = compute_binary_metrics(all_preds, all_labels)
+                    per_class = [
+                        f"c{c}=acc:{m['accuracy']:.3f}/p:{m['precision']:.3f}/r:{m['recall']:.3f}/f1:{m['f1']:.3f}"
+                        for c, m in enumerate(metrics['per_class'])
+                    ]
+                    print(
+                        f"\n  [Eval step {global_step}] acc={metrics['accuracy']:.4f}"
+                        f" exact_match={metrics['exact_match']:.4f}"
+                        f" precision={metrics['precision']:.4f}"
+                        f" recall={metrics['recall']:.4f}"
+                        f" f1={metrics['f1']:.4f}  {' '.join(per_class)}",
+                        flush=True,
+                    )
+                    if metrics['f1'] > best_val_acc:
+                        best_val_acc = metrics['f1']
                         unwrapped = accelerator.unwrap_model(model)
                         torch.save(unwrapped.state_dict(),
                                    os.path.join(args.output_dir, "best_model.pth"))
-                        print(f"\n  [Step {global_step}] New best val_acc={val_acc:.4f} → saved best_model.pth")
+                        print(f"  → New best → saved best_model.pth")
+                model.train()
 
             if global_step >= args.max_train_steps:
                 break

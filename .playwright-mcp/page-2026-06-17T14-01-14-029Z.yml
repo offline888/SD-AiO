@@ -1,0 +1,248 @@
+- generic [ref=e2]:
+  - generic [ref=e3]:
+    - link "Skip to content" [ref=e4] [cursor=pointer]:
+      - /url: "#start-of-content"
+    - banner [ref=e6]:
+      - heading "Navigation Menu" [level=2] [ref=e7]
+      - generic [ref=e8]:
+        - link "Homepage" [ref=e10] [cursor=pointer]:
+          - /url: /
+          - img [ref=e11]
+        - generic [ref=e13]:
+          - navigation "Global" [ref=e16]:
+            - list [ref=e17]:
+              - listitem [ref=e18]:
+                - button "Platform" [ref=e20] [cursor=pointer]:
+                  - text: Platform
+                  - img [ref=e21]
+              - listitem [ref=e23]:
+                - button "Solutions" [ref=e25] [cursor=pointer]:
+                  - text: Solutions
+                  - img [ref=e26]
+              - listitem [ref=e28]:
+                - button "Resources" [ref=e30] [cursor=pointer]:
+                  - text: Resources
+                  - img [ref=e31]
+              - listitem [ref=e33]:
+                - button "Open Source" [ref=e35] [cursor=pointer]:
+                  - text: Open Source
+                  - img [ref=e36]
+              - listitem [ref=e38]:
+                - button "Enterprise" [ref=e40] [cursor=pointer]:
+                  - text: Enterprise
+                  - img [ref=e41]
+              - listitem [ref=e43]:
+                - link "Pricing" [ref=e44] [cursor=pointer]:
+                  - /url: https://github.com/pricing
+                  - generic [ref=e45]: Pricing
+          - generic [ref=e46]:
+            - button "Search or jump to…" [ref=e49] [cursor=pointer]:
+              - img [ref=e51]
+            - generic [ref=e53]:
+              - link "Sign in" [ref=e54] [cursor=pointer]:
+                - /url: /login?return_to=https%3A%2F%2Fgithub.com%2Fcswry%2FOSEDiff%2Fblob%2Fmain%2Fpipeline%2Fpipeline_osediff.py
+              - generic [ref=e56]:
+                - heading "Sign in to GitHub" [level=4] [ref=e57]
+                - generic [ref=e58]:
+                  - text: Username or email address
+                  - textbox "Username or email address" [active] [ref=e59]
+                  - generic [ref=e60]:
+                    - text: Password
+                    - textbox "Password" [ref=e61]
+                    - link "Forgot password?" [ref=e62] [cursor=pointer]:
+                      - /url: /password_reset
+                    - button "Sign in" [ref=e63] [cursor=pointer]
+                - link "or continue with other methods" [ref=e66] [cursor=pointer]:
+                  - /url: /login?return_to=https%3A%2F%2Fgithub.com%2Fcswry%2FOSEDiff%2Fblob%2Fmain%2Fpipeline%2Fpipeline_osediff.py
+                  - generic [ref=e68]: or continue with other methods
+            - link "Sign up" [ref=e69] [cursor=pointer]:
+              - /url: /signup?ref_cta=Sign+up&ref_loc=header+logged+out&ref_page=%2F%3Cuser-name%3E%2F%3Crepo-name%3E%2Fblob%2Fshow&source=header-repo&source_repo=cswry%2FOSEDiff
+            - button "Appearance settings" [ref=e72] [cursor=pointer]:
+              - img
+  - main [ref=e76]:
+    - generic [ref=e77]:
+      - generic [ref=e78]:
+        - generic [ref=e80]:
+          - img [ref=e81]
+          - link "cswry" [ref=e84] [cursor=pointer]:
+            - /url: /cswry
+          - generic [ref=e85]: /
+          - strong [ref=e86]:
+            - link "OSEDiff" [ref=e87] [cursor=pointer]:
+              - /url: /cswry/OSEDiff
+          - generic [ref=e88]: Public
+        - generic [ref=e89]:
+          - list:
+            - listitem [ref=e90]:
+              - link "You must be signed in to change notification settings" [ref=e91] [cursor=pointer]:
+                - /url: /login?return_to=%2Fcswry%2FOSEDiff
+                - img [ref=e92]
+                - text: Notifications
+            - listitem [ref=e94]:
+              - link "Fork 39" [ref=e95] [cursor=pointer]:
+                - /url: /login?return_to=%2Fcswry%2FOSEDiff
+                - img [ref=e96]
+                - text: Fork
+                - generic "39" [ref=e98]
+            - listitem [ref=e99]:
+              - link "You must be signed in to star a repository" [ref=e101] [cursor=pointer]:
+                - /url: /login?return_to=%2Fcswry%2FOSEDiff
+                - img [ref=e102]
+                - text: Star
+                - generic "644 users starred this repository" [ref=e104]: "644"
+      - navigation "Repository" [ref=e105]:
+        - list [ref=e106]:
+          - listitem [ref=e107]:
+            - link "Code" [ref=e108] [cursor=pointer]:
+              - /url: /cswry/OSEDiff
+              - img [ref=e109]
+              - generic [ref=e111]: Code
+          - listitem [ref=e112]:
+            - link "Issues 39" [ref=e113] [cursor=pointer]:
+              - /url: /cswry/OSEDiff/issues
+              - img [ref=e114]
+              - generic [ref=e117]: Issues
+              - generic "39" [ref=e118]
+          - listitem [ref=e119]:
+            - link "Pull requests 2" [ref=e120] [cursor=pointer]:
+              - /url: /cswry/OSEDiff/pulls
+              - img [ref=e121]
+              - generic [ref=e123]: Pull requests
+              - generic "2" [ref=e124]
+          - listitem [ref=e125]:
+            - link "Actions" [ref=e126] [cursor=pointer]:
+              - /url: /cswry/OSEDiff/actions
+              - img [ref=e127]
+              - generic [ref=e129]: Actions
+          - listitem [ref=e130]:
+            - link "Projects" [ref=e131] [cursor=pointer]:
+              - /url: /cswry/OSEDiff/projects
+              - img [ref=e132]
+              - generic [ref=e134]: Projects
+          - listitem [ref=e135]:
+            - link "Security and quality" [ref=e136] [cursor=pointer]:
+              - /url: /cswry/OSEDiff/security
+              - img [ref=e137]
+              - generic [ref=e139]: Security and quality
+          - listitem [ref=e140]:
+            - link "Insights" [ref=e141] [cursor=pointer]:
+              - /url: /cswry/OSEDiff/pulse
+              - img [ref=e142]
+              - generic [ref=e144]: Insights
+    - generic [ref=e152]:
+      - generic [ref=e154]:
+        - generic [ref=e157]:
+          - generic [ref=e158]:
+            - generic [ref=e159]:
+              - heading "Collapse file tree" [level=2] [ref=e160]:
+                - button "Collapse file tree" [expanded] [ref=e161] [cursor=pointer]:
+                  - img [ref=e162]
+              - heading "Files" [level=2] [ref=e165]
+            - generic [ref=e166]:
+              - button "main branch" [ref=e168] [cursor=pointer]:
+                - generic [ref=e169]:
+                  - generic [ref=e171]:
+                    - img [ref=e173]
+                    - generic [ref=e176]: main
+                  - generic:
+                    - img
+              - button "Search this repository (forward slash)" [ref=e178] [cursor=pointer]:
+                - img [ref=e179]
+          - generic [ref=e182]:
+            - img [ref=e184]
+            - combobox "Go to file" [ref=e186]
+          - navigation "File Tree Navigation" [ref=e192]:
+            - tree "Files" [ref=e194]:
+              - treeitem "asserts" [level=1] [ref=e195]:
+                - generic [ref=e196] [cursor=pointer]:
+                  - img [ref=e198]
+                  - generic [ref=e200]:
+                    - img [ref=e204]
+                    - generic [ref=e206]: asserts
+              - treeitem "dataloaders" [level=1] [ref=e207]:
+                - generic [ref=e208] [cursor=pointer]:
+                  - img [ref=e210]
+                  - generic [ref=e212]:
+                    - img [ref=e216]
+                    - generic [ref=e218]: dataloaders
+              - treeitem "models" [level=1] [ref=e219]:
+                - generic [ref=e220] [cursor=pointer]:
+                  - img [ref=e222]
+                  - generic [ref=e224]:
+                    - img [ref=e228]
+                    - generic [ref=e230]: models
+              - treeitem "my_utils" [level=1] [ref=e231]:
+                - generic [ref=e232] [cursor=pointer]:
+                  - img [ref=e234]
+                  - generic [ref=e236]:
+                    - img [ref=e240]
+                    - generic [ref=e242]: my_utils
+              - treeitem "preset" [level=1] [ref=e243]:
+                - generic [ref=e244] [cursor=pointer]:
+                  - img [ref=e246]
+                  - generic [ref=e248]:
+                    - img [ref=e252]
+                    - generic [ref=e254]: preset
+              - treeitem "ram" [level=1] [ref=e255]:
+                - generic [ref=e256] [cursor=pointer]:
+                  - img [ref=e258]
+                  - generic [ref=e260]:
+                    - img [ref=e264]
+                    - generic [ref=e266]: ram
+              - treeitem "scripts" [level=1] [ref=e267]:
+                - generic [ref=e268] [cursor=pointer]:
+                  - img [ref=e270]
+                  - generic [ref=e272]:
+                    - img [ref=e276]
+                    - generic [ref=e278]: scripts
+              - treeitem "LICENCE" [level=1] [ref=e279]:
+                - generic [ref=e281] [cursor=pointer]:
+                  - img [ref=e284]
+                  - generic [ref=e286]: LICENCE
+              - treeitem "README.md" [level=1] [ref=e287]:
+                - generic [ref=e289] [cursor=pointer]:
+                  - img [ref=e292]
+                  - generic [ref=e294]: README.md
+              - treeitem "osediff.py" [level=1] [ref=e295]:
+                - generic [ref=e297] [cursor=pointer]:
+                  - img [ref=e300]
+                  - generic [ref=e302]: osediff.py
+              - treeitem "requirements.txt" [level=1] [ref=e303]:
+                - generic [ref=e305] [cursor=pointer]:
+                  - img [ref=e308]
+                  - generic [ref=e310]: requirements.txt
+              - treeitem "test_inference_time.py" [level=1] [ref=e311]:
+                - generic [ref=e313] [cursor=pointer]:
+                  - img [ref=e316]
+                  - generic [ref=e318]: test_inference_time.py
+              - treeitem "test_metrics.py" [level=1] [ref=e319]:
+                - generic [ref=e321] [cursor=pointer]:
+                  - img [ref=e324]
+                  - generic [ref=e326]: test_metrics.py
+              - treeitem "test_osediff.py" [level=1] [ref=e327]:
+                - generic [ref=e329] [cursor=pointer]:
+                  - img [ref=e332]
+                  - generic [ref=e334]: test_osediff.py
+              - treeitem "train_osediff.py" [level=1] [ref=e335]:
+                - generic [ref=e337] [cursor=pointer]:
+                  - img [ref=e340]
+                  - generic [ref=e342]: train_osediff.py
+              - treeitem "train_osediff_face.py" [level=1] [ref=e343]:
+                - generic [ref=e345] [cursor=pointer]:
+                  - img [ref=e348]
+                  - generic [ref=e350]: train_osediff_face.py
+        - slider "Draggable pane splitter" [ref=e352]
+      - generic [ref=e357]:
+        - img [ref=e358]
+        - generic [ref=e360]:
+          - generic [ref=e361]: 404 - page not found
+          - generic [ref=e362]:
+            - text: The
+            - paragraph [ref=e363]: main
+            - text: branch of
+            - paragraph [ref=e364]: OSEDiff
+            - text: does not contain the path
+            - paragraph [ref=e365]: pipeline/pipeline_osediff.py.
+        - link "go to Overview" [ref=e366] [cursor=pointer]:
+          - /url: /cswry/OSEDiff
+          - generic [ref=e368]: Return to the repository overview

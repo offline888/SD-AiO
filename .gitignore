@@ -7,7 +7,13 @@ swanlog/
 .aris/
 *.pdf
 *.log
-CLAUDE.md
 实验规划.md
 *.pth
 *.pkl
+vision-aided-gan/
+vision-aided-gan-main.zip
+ds_*.json
+debug_params.py
+reference/
+tests/
+vision-aided-gan-main.zip
