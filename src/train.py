@@ -103,6 +103,8 @@ def main():
     p.add_argument("--lambda_l2", type=float, default=1.0)
     p.add_argument("--lambda_lpips", type=float, default=0.5)
     p.add_argument("--lpips_model", type=str, default="vgg", choices=["vgg", "dino"])
+    p.add_argument("--lpips_layers", type=str, default="all",
+                   help="DINO LPIPS layers, '1-4' for shallow, 'all' for default")
     p.add_argument("--learning_rate", type=float, default=5e-5)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--max_train_steps", type=int, default=50000)
@@ -122,6 +124,8 @@ def main():
     p.add_argument("--degradation_classifier_path", type=str, default=None)
     p.add_argument("--num_deg_types", type=int, default=3)
     p.add_argument("--dino_type", type=str, default=None)
+    p.add_argument("--dino_lpips_ckpt", type=str, default=None,
+                   help="Path to classifier checkpoint for fine-tuned DINO LPIPS backbone")
     p.add_argument("--round_robin", action="store_true")
     p.add_argument("--train_batch_size", type=int, default=None)
     p.add_argument("--train_image_size", type=int, default=None)
@@ -139,6 +143,10 @@ def main():
     if is_main:
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
+        # Save full config for reproducibility
+        import json
+        with open(os.path.join(args.output_dir, "config.json"), "w") as cf:
+            json.dump(vars(args), cf, indent=2, default=str)
 
     # Model first (text_encoder is freed after caching)
     model = SDSingleStepRestoration(
@@ -182,7 +190,12 @@ def main():
         trainable = sum(p.numel() for p in trainable_params)
         print(f"Total: {total/1e6:.1f}M  Trainable: {trainable/1e6:.1f}M  ({trainable/total*100:.1f}%)", flush=True)
         print(f"  backbone={args.backbone_type}  cond={args.condition_type}  t={args.timestep_value}  grad_accum={args.gradient_accumulation_steps}", flush=True)
-        print(f"  lpips=vgg  λ_l2={args.lambda_l2}  λ_lpips={args.lambda_lpips}  bs={args.train_batch_size or 'yaml'}  lr={args.learning_rate}", flush=True)
+        _lpips_info = f"lpips={args.lpips_model}"
+        if args.lpips_model == "dino":
+            _lpips_info += f" layers={args.lpips_layers}"
+            if args.dino_lpips_ckpt:
+                _lpips_info += f" ckpt={args.dino_lpips_ckpt}"
+        print(f"  {_lpips_info}  λ_l2={args.lambda_l2}  λ_lpips={args.lambda_lpips}  bs={args.train_batch_size or 'yaml'}  lr={args.learning_rate}", flush=True)
 
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay, eps=args.adam_epsilon)
@@ -191,8 +204,15 @@ def main():
 
     if args.lpips_model == "dino":
         from dino_perceptual import DINOPerceptual
-        net_lpips = DINOPerceptual(model_name="/root/shared-nvme/model/dinov2",
-            version="v2", target_size=512).to(accelerator.device).bfloat16().eval()
+        from degnet import export_dino_backbone
+        _dino_name = args.dino_lpips_ckpt or "/root/shared-nvme/model/dinov2"
+        if args.dino_lpips_ckpt:
+            _dino_name = export_dino_backbone(args.dino_lpips_ckpt,
+                os.path.join(args.output_dir, "ft_dinov2"), dino_type=args.dino_type)
+        _layers = [int(x) for x in args.lpips_layers.split(",")] if args.lpips_layers != "all" else "all"
+        net_lpips = DINOPerceptual(
+            model_name=_dino_name, version="v2", target_size=512, layers=_layers
+        ).to(accelerator.device).bfloat16().eval()
     else:
         net_lpips = lpips.LPIPS(net="vgg").to(accelerator.device)
         net_lpips.requires_grad_(False)

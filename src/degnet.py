@@ -128,3 +128,31 @@ class DegFeatExtractor(nn.Module):
 
     def forward(self, lq_images: torch.Tensor) -> torch.Tensor:
         return self.get_deg_feat(lq_images)
+
+
+def export_dino_backbone(ckpt_path: str, output_dir: str, dino_type: str = None):
+    """从分类器 checkpoint 提取 fine-tuned DINOv2 backbone 并保存为 HF 格式.
+
+    用法:
+        from degnet import export_dino_backbone
+        export_dino_backbone("best_model.pth", "path/to/ft_dinov2")
+
+    然后用 --dino_lpips_ckpt 路径指向 output_dir.
+    """
+    import transformers
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    backbone_sd = {k.replace("encoder.", ""): v
+                   for k, v in ckpt.items() if k.startswith("encoder.")}
+    if not backbone_sd:
+        raise ValueError(f"No 'encoder.*' keys found in {ckpt_path}")
+    model = transformers.Dinov2Model.from_pretrained(
+        dino_type or "facebook/dinov2-base")
+    missing, unexpected = model.load_state_dict(backbone_sd, strict=False)
+    if missing:
+        print(f"[export_dino_backbone] {len(missing)} missing keys: {missing[:3]}")
+    if unexpected:
+        print(f"[export_dino_backbone] {len(unexpected)} unexpected keys: {unexpected[:3]}")
+    model.save_pretrained(output_dir)
+    model.config.save_pretrained(output_dir)
+    print(f"[export_dino_backbone] Saved {len(backbone_sd)} keys to {output_dir}")
+    return output_dir
