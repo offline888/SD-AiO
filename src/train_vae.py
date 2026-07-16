@@ -127,6 +127,7 @@ def main():
     p.add_argument("--degradation_classifier_path", type=str, required=True)
     p.add_argument("--num_deg_types", type=int, default=3)
     p.add_argument("--dino_type", type=str, required=True)
+    p.add_argument("--round_robin", action="store_true")
     p.add_argument("--train_batch_size", type=int, default=None)
     p.add_argument("--train_image_size", type=int, default=None)
     p.add_argument("--test_image_size", type=int, default=None)
@@ -170,6 +171,7 @@ def main():
 
     train_loader, valid_loaders = build_dataloaders(
         args.data_config, full_image_eval=False,
+        round_robin=args.round_robin,
         train_batch_size=args.train_batch_size,
         train_image_size=args.train_image_size,
         test_image_size=args.test_image_size,
