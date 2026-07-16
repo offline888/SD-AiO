@@ -220,6 +220,7 @@ def main():
             for n, p in pretrained_enc.encoder.named_parameters():
                 if "lora" in n:
                     p.requires_grad = True
+        pretrained_enc.eval()  # use running stats for frozen GroupNorm
         model.pretrained_encoder = pretrained_enc
         if hasattr(cond_module, 'deg_extractor'):
             deg_extractor = cond_module.deg_extractor
