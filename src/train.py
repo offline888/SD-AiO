@@ -4,6 +4,7 @@ from PIL import Image
 warnings.filterwarnings("ignore")
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from diffusers import AutoencoderKL
 from diffusers.optimization import get_scheduler
 from omegaconf import OmegaConf
 from PIL import Image
@@ -197,12 +198,15 @@ def main():
     deg_extractor = None
     if args.pretrained_encoder_path:
         from vae import PreRestoreEncoder
+        # Use clean encoder (no LoRA) — model.vae already has LoRA adapters applied
+        clean_vae = AutoencoderKL.from_pretrained(args.sd_path, subfolder="vae")
         pretrained_enc = PreRestoreEncoder(
-            encoder=model.vae.encoder,
-            block_out_channels=model.vae_config.block_out_channels,
+            encoder=clean_vae.encoder,
+            block_out_channels=clean_vae.config.block_out_channels,
             cond_dim=768,
             adaln_layers=args.adaln_layers,
         )
+        del clean_vae
         ckpt = torch.load(args.pretrained_encoder_path, map_location="cpu")
         pretrained_enc.load_state_dict(ckpt["encoder"])
         pretrained_enc.requires_grad_(False).eval()
