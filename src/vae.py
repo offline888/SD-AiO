@@ -17,13 +17,9 @@ class AdaIN(nn.Module):
         nn.init.zeros_(self.proj[-1].bias)
 
     def forward(self, x: torch.Tensor, f_deg: torch.Tensor):
-        mean = x.mean(dim=[2, 3], keepdim=True)
-        std = x.std(dim=[2, 3], keepdim=True) + 1e-6
-        x_norm = (x - mean) / std
-
         factors = self.proj(f_deg).unsqueeze(-1).unsqueeze(-1)  # [B, 2C, 1, 1]
         gamma, beta = factors.chunk(2, dim=1)
-        return x_norm * (1 + gamma) + beta
+        return x * (1 + gamma) + beta
 
 
 class PreRestoreEncoder(nn.Module):

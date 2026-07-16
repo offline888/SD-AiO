@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-from json import encoder
-import argparse, gc, os, warnings
+"""Stage 0 — Train PreRestoreEncoder: align LQ→VAE latent with HQ→VAE latent via AdaIN conditioned on F_Deg."""
+
+import argparse, gc, os, sys, warnings
 warnings.filterwarnings("ignore")
 
 import lpips
@@ -19,6 +20,20 @@ from tqdm.auto import tqdm
 from degnet import DegFeatExtractor
 from vae import PreRestoreEncoder
 from utils.dataset import build_dataloaders
+
+
+class Tee:
+    """Duplicate stdout to a log file."""
+    def __init__(self, path):
+        self.terminal = sys.stdout
+        self.log = open(path, "a")
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
 
 @torch.no_grad()
 def evaluate(
@@ -132,6 +147,7 @@ def main():
         import json
         with open(os.path.join(args.output_dir, "config.json"), "w") as cf:
             json.dump(vars(args), cf, indent=2, default=str)
+        sys.stdout = Tee(os.path.join(args.output_dir, "train.log"))
 
     weight_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(args.mixed_precision, torch.float32)
 

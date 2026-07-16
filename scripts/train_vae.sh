@@ -1,8 +1,7 @@
 #!/bin/bash
 # Stage 0: Train PreRestoreEncoder — LQ→latent alignment with AdaIN + F_Deg
-
 accelerate launch src/train_vae.py \
-  --sd_path /root/shared-nvme/model/stable-diffusion-2-1-base \
+  --sd_path /root/shared-nvme/model/sd2-1 \
   --data_config configs/tasks_3d.yaml \
   --output_dir ./output/vae_pretrain \
   --degradation_classifier_path /root/shared-nvme/SD-AiO/checkpoints/classifier/best_model.pth \
