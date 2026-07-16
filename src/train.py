@@ -212,11 +212,11 @@ def main():
         pretrained_enc.requires_grad_(False)
         # Add LoRA to pretrained encoder (base frozen, lora trainable)
         if args.enable_lora and args.lora_rank_vae_encoder:
-            from peft import LoraConfig
-            targets = r"\.*(conv1|conv2|conv_in|conv_shortcut|conv_out|to_k|to_q|to_v|to_out\.0)$"
+            from peft import get_peft_model, LoraConfig
+            targets = r".*\.(conv1|conv2|conv_in|conv_shortcut|conv_out|to_k|to_q|to_v|to_out\.0)$"
             cfg = LoraConfig(r=args.lora_rank_vae_encoder, init_lora_weights="gaussian",
                              target_modules=targets)
-            pretrained_enc.encoder.add_adapter(cfg, adapter_name="pretrained_encoder_lora")
+            pretrained_enc.encoder = get_peft_model(pretrained_enc.encoder, cfg)
             for n, p in pretrained_enc.encoder.named_parameters():
                 if "lora" in n:
                     p.requires_grad = True
