@@ -63,7 +63,7 @@ def evaluate(
             f_deg = deg_extractor(lq)
             z_raw = unwarp_encoder(lq, f_deg)
             z_mean = frozen_vae.quant_conv(z_raw.to(dtype=vae_dtype))[:, :4]
-            pred = frozen_vae.decode(z_mean / scale).sample.clamp(-1, 1)
+            pred = frozen_vae.decode(z_mean).sample.clamp(-1, 1)
 
             pf, gf = pred.float(), gt.float()
             lp = net_lpips(pf, gf).mean().item()
