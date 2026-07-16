@@ -92,7 +92,9 @@ def main():
     p.add_argument("--resume_from", type=str, default=None)
     p.add_argument("--enable_lora", action="store_true")
     p.add_argument("--lora_rank_unet", type=int, default=0)
-    p.add_argument("--lora_rank_vae", type=int, default=0)
+    p.add_argument("--lora_rank_vae_encoder", type=int, default=None)
+    p.add_argument("--lora_rank_vae_decoder", type=int, default=None)
+
     p.add_argument("--condition_type", type=str, default="deg-aware")
     p.add_argument("--condition_embed_dim", type=int, default=256)
     p.add_argument("--backbone_type", type=str, default="resnet18", choices=["simple-conv", "resnet18", "convnext_tiny"])
@@ -152,7 +154,8 @@ def main():
     model = SDSingleStepRestoration(
         sd_path=args.sd_path,
         lora_rank_unet=args.lora_rank_unet if args.enable_lora else 0,
-        lora_rank_vae=args.lora_rank_vae if args.enable_lora else 0,
+        lora_rank_vae_encoder=args.lora_rank_vae_encoder if args.enable_lora else 0,
+        lora_rank_vae_decoder=args.lora_rank_vae_decoder if args.enable_lora else 0,
         num_inference_steps=args.num_inference_steps,
         enable_xformers=args.enable_xformers,
     )

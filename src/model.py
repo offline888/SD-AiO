@@ -164,8 +164,14 @@ class SDSingleStepRestoration(nn.Module):
         self.text_encoder.cpu()
         torch.cuda.empty_cache()
 
+    # def is_trainable_param(self, name):
+    #    return "lora" in name or "conv_in" in name
     def is_trainable_param(self, name):
-        return "lora" in name or "conv_in" in name
+        if "lora" in name:
+            return True
+        if self.train_unet_conv_in and "conv_in" in name:
+            return True
+        return False
 
     def set_trainable_params(self):
         self.unet.train(); self.vae.train()
