@@ -208,9 +208,10 @@ class SDSingleStepRestoration(nn.Module):
         unet_p = next(self.unet.parameters())
         vae_p = next(self.vae.parameters())
         enc = pretrained_encoder or getattr(self, 'pretrained_encoder', None)
+        deg_ext = deg_extractor or getattr(self, 'deg_extractor', None)
 
-        if enc is not None and deg_extractor is not None:
-            f_deg = deg_extractor.get_deg_feat(lq_image)
+        if enc is not None and deg_ext is not None:
+            f_deg = deg_ext.get_deg_feat(lq_image)
             z_raw = enc(lq_image.to(device=vae_p.device, dtype=vae_p.dtype),
                         f_deg.to(device=vae_p.device, dtype=vae_p.dtype))
             z_mean = self.vae.quant_conv(z_raw)[:, :4]
