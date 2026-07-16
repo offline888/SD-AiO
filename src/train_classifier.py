@@ -90,6 +90,8 @@ def main():
     parser.add_argument("--log_with", type=str, default=None)
     parser.add_argument("--focal_gamma", type=float, default=2.0,
                         help="Focal Loss gamma; 0 = plain CrossEntropy")
+    parser.add_argument("--round_robin", action="store_true",
+                        help="Use repeat_ratio from task config to balance classes")
     args = parser.parse_args()
 
     task_cfg = OmegaConf.load(args.task_config)

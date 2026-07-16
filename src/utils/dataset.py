@@ -190,11 +190,13 @@ class ClassificationDataset(Dataset):
         for task in task_entries:
             lq_map = scan_images(task['lq_path'])
             label = deg_to_label(task['deg_type'], deg_types, num_deg_types)
+            repeat = int(task.get('repeat_ratio', 1))
             for stem in sorted(lq_map):
-                self.samples.append({
-                    'path': str(Path(task['lq_path']) / f"{stem}{lq_map[stem]}"),
-                    'label': label,
-                })
+                for _ in range(repeat):
+                    self.samples.append({
+                        'path': str(Path(task['lq_path']) / f"{stem}{lq_map[stem]}"),
+                        'label': label,
+                    })
             print(f"  [{task['name']}] {len(lq_map)} images  deg={task['deg_type']}  label={label.tolist()}")
 
         print(f"Total: {len(self.samples)} images")
