@@ -107,6 +107,7 @@ class SDSingleStepRestoration(nn.Module):
             lora_rank_vae_decoder = lora_rank_vae_decoder or lora_rank_vae
 
         self.vae_config = self.vae.config
+        self.train_unet_conv_in = False
         self.lora_rank_unet = lora_rank_unet
         self.lora_rank_vae_encoder = lora_rank_vae_encoder
         self.lora_rank_vae_decoder = lora_rank_vae_decoder
