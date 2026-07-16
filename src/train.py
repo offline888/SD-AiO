@@ -209,18 +209,31 @@ def main():
         del clean_vae
         ckpt = torch.load(args.pretrained_encoder_path, map_location="cpu")
         pretrained_enc.load_state_dict(ckpt["encoder"])
-        pretrained_enc.requires_grad_(False).eval()
+        pretrained_enc.requires_grad_(False)
+        # Add LoRA to pretrained encoder (base frozen, lora trainable)
+        if args.enable_lora and args.lora_rank_vae_encoder:
+            from peft import LoraConfig
+            targets = r"\.*(conv1|conv2|conv_in|conv_shortcut|conv_out|to_k|to_q|to_v|to_out\.0)$"
+            cfg = LoraConfig(r=args.lora_rank_vae_encoder, init_lora_weights="gaussian",
+                             target_modules=targets)
+            pretrained_enc.encoder.add_adapter(cfg, adapter_name="pretrained_encoder_lora")
+            for n, p in pretrained_enc.encoder.named_parameters():
+                if "lora" in n:
+                    p.requires_grad = True
         model.pretrained_encoder = pretrained_enc
         if hasattr(cond_module, 'deg_extractor'):
             deg_extractor = cond_module.deg_extractor
             model.deg_extractor = deg_extractor
         if is_main:
-            print(f"[PretrainedEncoder] loaded from {args.pretrained_encoder_path}", flush=True)
+            _lora_info = f" LoRA_rank={args.lora_rank_vae_encoder}" if args.enable_lora and args.lora_rank_vae_encoder else ""
+            print(f"[PretrainedEncoder] loaded from {args.pretrained_encoder_path}{_lora_info}", flush=True)
 
     # Optimizer (both model + cond_module trainable params)
     trainable_params = list(model.trainable_parameters())
     if cond_module is not None:
         trainable_params += [p for p in cond_module.parameters() if p.requires_grad]
+    if pretrained_enc is not None:
+        trainable_params += [p for p in pretrained_enc.parameters() if p.requires_grad]
     if is_main:
         total = sum(p.numel() for p in model.parameters())
         trainable = sum(p.numel() for p in trainable_params)
