@@ -202,12 +202,23 @@ class SDSingleStepRestoration(nn.Module):
         return ((1 - a) ** 0.5) / (a ** 0.5)
 
     def forward(self, lq_image, text_embedding, timestep=None,
-                timestep_range=(50, 150), cond_module=None):
+                timestep_range=(50, 150), cond_module=None,
+                deg_extractor=None, pretrained_encoder=None):
         unet_p = next(self.unet.parameters())
         vae_p = next(self.vae.parameters())
+        enc = pretrained_encoder or getattr(self, 'pretrained_encoder', None)
 
-        encoded_latent = self.encode_image(lq_image.to(device=vae_p.device, dtype=vae_p.dtype))
-        encoded_latent = encoded_latent.to(device=unet_p.device, dtype=unet_p.dtype)
+        if enc is not None and deg_extractor is not None:
+            f_deg = deg_extractor.get_deg_feat(lq_image)
+            z_raw = enc(lq_image.to(device=vae_p.device, dtype=vae_p.dtype),
+                        f_deg.to(device=vae_p.device, dtype=vae_p.dtype))
+            z_mean = self.vae.quant_conv(z_raw)[:, :4]
+            encoded_latent = z_mean * self.vae_config.scaling_factor
+            encoded_latent = encoded_latent.to(device=unet_p.device, dtype=unet_p.dtype)
+        else:
+            f_deg = None
+            encoded_latent = self.encode_image(lq_image.to(device=vae_p.device, dtype=vae_p.dtype))
+            encoded_latent = encoded_latent.to(device=unet_p.device, dtype=unet_p.dtype)
 
         noise = torch.randn_like(encoded_latent)
         if timestep is None or timestep <= 0:
@@ -223,7 +234,7 @@ class SDSingleStepRestoration(nn.Module):
 
         if cond_module is not None:
             _, text_embedding = cond_module.get_modulation(
-                lq_image, text_embedding=text_embedding, timestep=timestep)
+                lq_image, text_embedding=text_embedding, timestep=timestep, f_deg=f_deg)
 
         noise_pred = self.unet(noisy_latent, t_tensor, encoder_hidden_states=text_embedding).sample
         coeff = self.eps_to_coeff(t_tensor).to(device=unet_p.device, dtype=unet_p.dtype)

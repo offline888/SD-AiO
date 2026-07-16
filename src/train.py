@@ -18,13 +18,17 @@ from utils.text_cache import TextEmbeddingContainer
 
 
 class TrainBundle(nn.Module):
-    def __init__(self, model, cond_module):
+    def __init__(self, model, cond_module, pretrained_encoder=None, deg_extractor=None):
         super().__init__()
         self.model = model
         self.cond_module = cond_module
+        self.pretrained_encoder = pretrained_encoder
+        self.deg_extractor = deg_extractor
     def forward(self, lq_image, text_embed, timestep=None, cond_module=None):
         cm = cond_module if cond_module is not None else self.cond_module
-        return self.model(lq_image, text_embed, timestep=timestep, cond_module=cm)
+        return self.model(lq_image, text_embed, timestep=timestep, cond_module=cm,
+                          deg_extractor=self.deg_extractor,
+                          pretrained_encoder=self.pretrained_encoder)
 
 
 def sample_timestep(cfg):
@@ -129,6 +133,10 @@ def main():
     p.add_argument("--dino_lpips_ckpt", type=str, default=None,
                    help="Path to classifier checkpoint for fine-tuned DINO LPIPS backbone")
     p.add_argument("--round_robin", action="store_true")
+    p.add_argument("--pretrained_encoder_path", type=str, default=None,
+                   help="Path to stage-0 vae checkpoint (PreRestoreEncoder)")
+    p.add_argument("--adaln_layers", type=str, nargs="+",
+                   default=["down2", "down3", "mid"])
     p.add_argument("--train_batch_size", type=int, default=None)
     p.add_argument("--train_image_size", type=int, default=None)
     p.add_argument("--test_image_size", type=int, default=None)
@@ -184,6 +192,27 @@ def main():
     if hasattr(cond_module, 'build_deg_extractor'):
         cond_module.build_deg_extractor(accelerator.device)
 
+    # ── Pretrained VAE encoder (stage 0, frozen) ──
+    pretrained_enc = None
+    deg_extractor = None
+    if args.pretrained_encoder_path:
+        from vae import PreRestoreEncoder
+        pretrained_enc = PreRestoreEncoder(
+            encoder=model.vae.encoder,
+            block_out_channels=model.vae_config.block_out_channels,
+            cond_dim=768,
+            adaln_layers=args.adaln_layers,
+        )
+        ckpt = torch.load(args.pretrained_encoder_path, map_location="cpu")
+        pretrained_enc.load_state_dict(ckpt["encoder"])
+        pretrained_enc.requires_grad_(False).eval()
+        model.pretrained_encoder = pretrained_enc
+        if hasattr(cond_module, 'deg_extractor'):
+            deg_extractor = cond_module.deg_extractor
+            model.deg_extractor = deg_extractor
+        if is_main:
+            print(f"[PretrainedEncoder] loaded from {args.pretrained_encoder_path}", flush=True)
+
     # Optimizer (both model + cond_module trainable params)
     trainable_params = list(model.trainable_parameters())
     if cond_module is not None:
@@ -221,7 +250,8 @@ def main():
         net_lpips.requires_grad_(False)
 
     # Prepare (S3Diff-style: all training in one prepare, eval loaders stay raw)
-    train_bundle = TrainBundle(model, cond_module)
+    train_bundle = TrainBundle(model, cond_module, pretrained_encoder=pretrained_enc,
+                               deg_extractor=deg_extractor)
     train_bundle, optimizer, lr_scheduler, train_loader = accelerator.prepare(
         train_bundle, optimizer, lr_scheduler, train_loader)
 

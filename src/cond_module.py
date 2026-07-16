@@ -276,16 +276,19 @@ class DegAwareModule(BaseConditionModule):
     def setup(self, unet):
         self.spatial_extractor.setup(unet)
 
-    def get_modulation(self, lq_image, text_embedding=None, timestep=None):
+    def get_modulation(self, lq_image, text_embedding=None, timestep=None, f_deg=None):
         device, dtype = next(self.parameters()).device, next(self.parameters()).dtype
 
         # Spatial: backbone → SPADE (no degradation modulation)
         self.spatial_extractor.get_modulation(lq_image)
 
         # Text: F_Deg → deg_token → prepend to text_embedding
-        self.build_deg_extractor(lq_image.device)
-        F_deg = self.deg_extractor.get_deg_feat(lq_image).to(device=device, dtype=dtype)
-        text_embedding = self.text_fusion(F_deg, text_embedding)
+        if f_deg is None:
+            self.build_deg_extractor(lq_image.device)
+            f_deg = self.deg_extractor.get_deg_feat(lq_image).to(device=device, dtype=dtype)
+        else:
+            f_deg = f_deg.to(device=device, dtype=dtype)
+        text_embedding = self.text_fusion(f_deg, text_embedding)
 
         return None, text_embedding
 
